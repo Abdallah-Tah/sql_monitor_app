@@ -96,3 +96,19 @@ def log_job_check_result(job_name, status, last_run, next_run, message):
             "next_run": next_run,
             "message": message
         })
+
+
+def delete_table_config(db_name, table_name):
+    with engine.begin() as conn:
+        conn.execute(text("""
+        DELETE FROM table_monitor_config 
+        WHERE db_name = :db AND table_name = :table
+        """), {"db": db_name, "table": table_name})
+
+
+def delete_job_config(job_name):
+    with engine.begin() as conn:
+        conn.execute(text("""
+        DELETE FROM job_monitor_config 
+        WHERE job_name = :job
+        """), {"job": job_name})
