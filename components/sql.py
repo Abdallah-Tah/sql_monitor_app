@@ -13,7 +13,7 @@ def get_connection(db=None):
         windows_user = get_windows_user()
         conn_str = (
             "DRIVER={ODBC Driver 17 for SQL Server};"
-            "SERVER=10.1.1.88;"
+            "SERVER=;"
             "Trusted_Connection=yes;"
             "TrustServerCertificate=yes;"
         )
