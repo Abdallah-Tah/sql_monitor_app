@@ -1,4 +1,4 @@
-from components.db import init_db
+from components.db import init_db, update_db_schema
 from components.ui import render_ui
 import streamlit as st
 from datetime import datetime
@@ -11,8 +11,9 @@ st.set_page_config(
 )
 
 
-# Initialize the app
+# Initialize the app and update schema if needed
 init_db()
+update_db_schema()
 
 # Initialize session state
 if 'refresh_counter' not in st.session_state:
