@@ -317,7 +317,8 @@ def render_job_details(job_name):
         with col2:
             st.markdown("#### Job Steps")
             steps_df = get_job_steps(job_name)
-            if not steps_df.empty:
+            # Check if steps_df is a DataFrame and not empty
+            if isinstance(steps_df, pd.DataFrame) and not steps_df.empty:
                 st.dataframe(apply_status_colors(
                     steps_df, 'Last Status'), use_container_width=True)
             else:
