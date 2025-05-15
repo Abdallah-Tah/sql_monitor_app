@@ -59,6 +59,17 @@ def init_db():
             details TEXT
         );
         """))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS column_monitor_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            db_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            condition_type TEXT NOT NULL,
+            condition_value TEXT NOT NULL,
+            UNIQUE(db_name, table_name, column_name)
+        );
+        """))
 
 
 def update_db_schema():
@@ -244,5 +255,51 @@ def get_alerts(limit=100, alert_type=None, source_type=None, status=None, hours_
 
     query += " ORDER BY alert_time DESC LIMIT :limit"
     params["limit"] = limit
+
+    return pd.read_sql(query, con=engine, params=params)
+
+
+def save_column_config(db_name, table_name, column_configs):
+    """
+    Save column monitoring configuration
+    column_configs: list of dicts with keys: column_name, condition_type, condition_value
+    """
+    with engine.begin() as conn:
+        # First delete existing config for this table
+        conn.execute(text("""
+        DELETE FROM column_monitor_config
+        WHERE db_name = :db AND table_name = :table
+        """), {"db": db_name, "table": table_name})
+
+        # Insert new configurations
+        for config in column_configs:
+            conn.execute(text("""
+            INSERT INTO column_monitor_config 
+            (db_name, table_name, column_name, condition_type, condition_value)
+            VALUES (:db, :table, :column, :cond_type, :cond_value)
+            """), {
+                "db": db_name,
+                "table": table_name,
+                "column": config["column_name"],
+                "cond_type": config["condition_type"],
+                "cond_value": config["condition_value"]
+            })
+
+
+def load_column_config(db_name=None, table_name=None):
+    """Load column monitoring configuration with optional filtering"""
+    query = "SELECT * FROM column_monitor_config"
+    params = {}
+    wheres = []
+
+    if db_name:
+        wheres.append("db_name = :db")
+        params["db"] = db_name
+    if table_name:
+        wheres.append("table_name = :table")
+        params["table"] = table_name
+
+    if wheres:
+        query += " WHERE " + " AND ".join(wheres)
 
     return pd.read_sql(query, con=engine, params=params)

@@ -5,12 +5,14 @@ from datetime import datetime, timedelta
 from components.sql import (
     get_databases, get_tables, check_selected_tables, get_job_history,
     get_active_jobs, get_all_jobs, get_windows_user, get_job_details, get_job_steps,
-    get_table_size_info  # Added import
+    # Added check_column_conditions
+    get_table_size_info, get_table_columns, check_column_conditions
 )
 from components.db import (
     save_table_config, load_saved_table_config, log_table_check_result, get_latest_log,
     save_job_config, load_saved_job_config, log_job_check_result, delete_table_config,
-    delete_job_config, log_alert, get_alerts
+    # Added imports
+    delete_job_config, log_alert, get_alerts, save_column_config, load_column_config
 )
 
 
@@ -152,61 +154,150 @@ def render_table_monitor():
             # For each selected table, show threshold configuration
             threshold_settings = {}
             if selected_tables:
-                st.subheader("Row Count Thresholds")
-                st.info(
-                    "Set min/max row count thresholds to monitor. Leave blank for no threshold.")
+                st.subheader("Monitoring Configuration")
+                tab1, tab2 = st.tabs(
+                    ["Row Count Thresholds", "Column Conditions"])
 
-                # Create dictionaries to store threshold values
-                min_rows_dict = {}
-                max_rows_dict = {}
+                with tab1:
+                    st.info(
+                        "Set min/max row count thresholds to monitor. Leave blank for no threshold.")
 
-                # Get existing thresholds from database for selected tables
-                existing_config = load_saved_table_config()
+                    # Create dictionaries to store threshold values
+                    min_rows_dict = {}
+                    max_rows_dict = {}
 
-                for table in selected_tables:
-                    # Check if table already has thresholds
-                    existing_min = None
-                    existing_max = None
+                    # Get existing thresholds from database for selected tables
+                    existing_config = load_saved_table_config()
 
-                    if not existing_config.empty:
-                        table_config = existing_config[
-                            (existing_config['db_name'] == selected_db) &
-                            (existing_config['table_name'] == table)
-                        ]
+                    for table in selected_tables:
+                        # Check if table already has thresholds
+                        existing_min = None
+                        existing_max = None
 
-                        if not table_config.empty:
-                            existing_min = table_config.iloc[0]['min_rows'] if pd.notna(
-                                table_config.iloc[0]['min_rows']) else None
-                            existing_max = table_config.iloc[0]['max_rows'] if pd.notna(
-                                table_config.iloc[0]['max_rows']) else None
+                        if not existing_config.empty:
+                            table_config = existing_config[
+                                (existing_config['db_name'] == selected_db) &
+                                (existing_config['table_name'] == table)
+                            ]
 
-                    # Show threshold inputs for this table
-                    st.markdown(f"**{table}**")
-                    col_min, col_max = st.columns(2)
+                            if not table_config.empty:
+                                existing_min = table_config.iloc[0]['min_rows'] if pd.notna(
+                                    table_config.iloc[0]['min_rows']) else None
+                                existing_max = table_config.iloc[0]['max_rows'] if pd.notna(
+                                    table_config.iloc[0]['max_rows']) else None
 
-                    with col_min:
-                        min_val = st.number_input(
-                            "Min Rows",
-                            min_value=0,
-                            value=int(
-                                existing_min) if existing_min is not None else None,
-                            key=f"min_rows_{table}"
-                        )
-                        if min_val > 0:  # Only save if user entered a value
-                            min_rows_dict[table] = min_val
+                        st.markdown(f"**{table}**")
+                        col_min, col_max = st.columns(2)
 
-                    with col_max:
-                        max_val = st.number_input(
-                            "Max Rows",
-                            min_value=0,
-                            value=int(
-                                existing_max) if existing_max is not None else None,
-                            key=f"max_rows_{table}"
-                        )
-                        if max_val > 0:  # Only save if user entered a value
-                            max_rows_dict[table] = max_val
+                        with col_min:
+                            min_val = st.number_input(
+                                "Min Rows",
+                                min_value=0,
+                                value=int(
+                                    existing_min) if existing_min is not None else 0,
+                                key=f"min_rows_{table}"
+                            )
+                            if min_val > 0:  # Only save if user entered a value
+                                min_rows_dict[table] = min_val
+
+                        with col_max:
+                            max_val = st.number_input(
+                                "Max Rows",
+                                min_value=0,
+                                value=int(
+                                    existing_max) if existing_max is not None else 0,
+                                key=f"max_rows_{table}"
+                            )
+                            if max_val > 0:  # Only save if user entered a value
+                                max_rows_dict[table] = max_val
+
+                with tab2:
+                    st.info(
+                        "Configure conditions for specific columns to monitor (optional)")
+                    for table in selected_tables:
+                        st.markdown(f"**{table}**")
+                        columns = get_table_columns(selected_db, table)
+
+                        if columns:
+                            # Add a checkbox to enable/disable column monitoring for this table
+                            enable_column_monitoring = st.checkbox(
+                                "Enable Column Monitoring",
+                                value=False,  # Default to disabled
+                                key=f"enable_columns_{table}"
+                            )
+
+                            if enable_column_monitoring:
+                                existing_config = load_column_config(
+                                    selected_db, table)
+                                selected_columns = st.multiselect(
+                                    "Select columns to monitor",
+                                    options=[col["name"] for col in columns],
+                                    default=[cfg["column_name"] for _, cfg in existing_config.iterrows(
+                                    )] if not existing_config.empty else None,
+                                    key=f"columns_{table}"
+                                )
+
+                                column_configs = []
+                                for col in selected_columns:
+                                    col_type = next(
+                                        (c["type"] for c in columns if c["name"] == col), None)
+                                    st.markdown(f"***{col}*** ({col_type})")
+
+                                    # Find existing configuration for this column
+                                    existing_col_config = existing_config[
+                                        existing_config["column_name"] == col
+                                    ].iloc[0] if not existing_config.empty and col in existing_config["column_name"].values else None
+
+                                    condition = st.selectbox(
+                                        "Condition",
+                                        options=["equals", "not_equals",
+                                                 "greater_than", "less_than", "in"],
+                                        index=["equals", "not_equals", "greater_than", "less_than", "in"].index(
+                                            existing_col_config["condition_type"]) if existing_col_config is not None else 0,
+                                        key=f"condition_{table}_{col}"
+                                    )
+
+                                    value = st.text_input(
+                                        "Value" +
+                                        (" (comma-separated for IN)" if condition ==
+                                         "in" else ""),
+                                        value=existing_col_config["condition_value"] if existing_col_config is not None else "",
+                                        key=f"value_{table}_{col}"
+                                    )
+
+                                    if value:  # Only add configuration if a value is provided
+                                        column_configs.append({
+                                            "column_name": col,
+                                            "condition_type": condition,
+                                            "condition_value": value
+                                        })
+
+                                # Store column configs in the table's threshold settings
+                                if column_configs:
+                                    if table not in threshold_settings:
+                                        threshold_settings[table] = {}
+                                    threshold_settings[table]["column_configs"] = column_configs
+                            else:
+                                # If monitoring is disabled, clear any existing configurations
+                                save_column_config(selected_db, table, [])
 
             if st.button("Save Selected Tables", key="save_tables"):
+                for table in selected_tables:
+                    # Get the enable/disable state for column monitoring
+                    enable_column_monitoring = st.session_state.get(
+                        f"enable_columns_{table}", False)
+
+                    # Only save column configs if monitoring is enabled
+                    if enable_column_monitoring:
+                        column_configs = threshold_settings.get(
+                            table, {}).get("column_configs", [])
+                        if column_configs:  # Only save column config if there are configurations
+                            save_column_config(
+                                selected_db, table, column_configs)
+                    else:
+                        # Clear any existing column configurations when monitoring is disabled
+                        save_column_config(selected_db, table, [])
+
                 save_table_config(selected_db, selected_tables,
                                   min_rows_dict, max_rows_dict)
                 st.success("Configuration saved.")
@@ -217,63 +308,51 @@ def render_table_monitor():
         saved_tables = load_saved_table_config()
 
         if not saved_tables.empty:
-            # Create threshold dictionaries for the check_selected_tables function
-            min_rows_dict = {row['table_name']: row['min_rows']
-                             for _, row in saved_tables.iterrows() if pd.notna(row['min_rows'])}
-            max_rows_dict = {row['table_name']: row['max_rows']
-                             for _, row in saved_tables.iterrows() if pd.notna(row['max_rows'])}
-
             # Create a container for the table list
             with st.container():
-                for _, row in saved_tables.iterrows():
+                for idx, row in saved_tables.iterrows():
                     col_info, col_remove = st.columns([5, 1])
 
-                    # Get table specific thresholds
-                    table_min = row['min_rows'] if pd.notna(
-                        row['min_rows']) else None
-                    table_max = row['max_rows'] if pd.notna(
-                        row['max_rows']) else None
-                    table_min_dict = {
-                        row['table_name']: table_min} if table_min is not None else {}
-                    table_max_dict = {
-                        row['table_name']: table_max} if table_max is not None else {}
-
-                    check_result_df = check_selected_tables(
-                        row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
-
-                    count = 0
-                    status = "Error"
-                    if not check_result_df.empty:
-                        count = int(
-                            check_result_df.iloc[0]["Rows"]) if check_result_df.iloc[0]["Rows"].isdigit() else 0
-                        status = check_result_df.iloc[0]["Status"]
-
-                    # Get table size info
-                    size_info = get_table_size_info(
-                        row["db_name"], row["table_name"])
-                    data_mb = size_info['data_kb'] / 1024
-                    index_mb = size_info['index_kb'] / 1024
-                    total_mb = data_mb + index_mb
-
-                    # Prepare threshold info to display
-                    threshold_info = ""
-                    if table_min is not None or table_max is not None:
-                        threshold_info = " - Thresholds: "
-                        if table_min is not None:
-                            threshold_info += f"Min={table_min}"
-                        if table_min is not None and table_max is not None:
-                            threshold_info += ", "
-                        if table_max is not None:
-                            threshold_info += f"Max={table_max}"
-
-                    # Display table information
                     with col_info:
+                        table_min = row['min_rows'] if pd.notna(
+                            row['min_rows']) else None
+                        table_max = row['max_rows'] if pd.notna(
+                            row['max_rows']) else None
+                        table_min_dict = {
+                            row['table_name']: table_min} if table_min is not None else {}
+                        table_max_dict = {
+                            row['table_name']: table_max} if table_max is not None else {}
+
+                        check_result_df = check_selected_tables(
+                            row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
+                        count = 0
+                        status = "Error"
+                        if not check_result_df.empty:
+                            count = int(
+                                check_result_df.iloc[0]["Rows"]) if check_result_df.iloc[0]["Rows"].isdigit() else 0
+                            status = check_result_df.iloc[0]["Status"]
+
+                        size_info = get_table_size_info(
+                            row["db_name"], row["table_name"])
+                        data_mb = size_info['data_kb'] / 1024
+                        index_mb = size_info['index_kb'] / 1024
+                        total_mb = data_mb + index_mb
+
+                        threshold_info = ""
+                        if table_min is not None or table_max is not None:
+                            threshold_info = " - Thresholds: "
+                            if table_min is not None:
+                                threshold_info += f"Min={table_min}"
+                            if table_min is not None and table_max is not None:
+                                threshold_info += ", "
+                            if table_max is not None:
+                                threshold_info += f"Max={table_max}"
+
                         st.write(
                             f"{row['db_name']}.{row['table_name']} - {status} (Rows: {count}){threshold_info} - Size: {total_mb:.2f} MB (Data: {data_mb:.2f} MB, Index: {index_mb:.2f} MB)")
 
-                    # Add remove button
                     with col_remove:
-                        if st.button("🗑️", key=f"remove_table_{row['db_name']}_{row['table_name']}"):
+                        if st.button("🗑️", key=f"remove_table_{idx}"):
                             delete_table_config(
                                 row["db_name"], row["table_name"])
                             st.experimental_rerun()
@@ -293,7 +372,18 @@ def render_table_monitor():
 
             if results:
                 st.markdown("### Detailed Status")
-                status_df = pd.DataFrame(results)
+                status_df = pd.DataFrame(results).astype({
+                    'Database': str,
+                    'Table': str,
+                    'Row Count': int,
+                    'Status': str,
+                    'Min Rows': str,
+                    'Max Rows': str,
+                    'Data MB': float,
+                    'Index MB': float,
+                    'Total MB': float,
+                    'Last Check': str
+                })
                 st.dataframe(apply_status_colors(
                     status_df, 'Status'), use_container_width=True)
         else:
@@ -660,9 +750,13 @@ def render_dashboard_view():
     with col2:
         st.markdown("### ⚠️ Table Issues")
         if not table_stats.empty:
+            # Only show tables that have actual issues (Empty tables or failed column conditions)
             problem_tables = table_stats[
                 (table_stats['Status'] == 'Empty') |
-                (table_stats['Status'].str.startswith('Error'))
+                # For failed column conditions
+                (table_stats['Status'].str.contains('not met')) |
+                (table_stats['Status'] == 'Warn-LowCount') |
+                (table_stats['Status'] == 'Warn-HighCount')
             ]
             if not problem_tables.empty:
                 for _, table in problem_tables.iterrows():
@@ -842,8 +936,10 @@ def get_latest_table_results():
             # Get table specific thresholds
             table_min = row['min_rows'] if pd.notna(row['min_rows']) else None
             table_max = row['max_rows'] if pd.notna(row['max_rows']) else None
-            table_min_dict = {row['table_name']: table_min} if table_min is not None else {}
-            table_max_dict = {row['table_name']: table_max} if table_max is not None else {}
+            table_min_dict = {row['table_name']
+                : table_min} if table_min is not None else {}
+            table_max_dict = {row['table_name']
+                : table_max} if table_max is not None else {}
 
             check_result_df = check_selected_tables(
                 row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)

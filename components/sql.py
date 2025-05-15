@@ -3,6 +3,7 @@ import pyodbc
 import pandas as pd
 from datetime import datetime, timedelta
 import os
+from components.db import load_column_config
 
 
 def get_windows_user():
@@ -54,7 +55,7 @@ def get_tables(db):
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
     results = []
-    conn = get_connection(db)  # Updated
+    conn = get_connection(db)
     cursor = conn.cursor()
     try:
         for table in tables:
@@ -66,15 +67,47 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
                 min_rows = min_rows_dict.get(table) if min_rows_dict else None
                 max_rows = max_rows_dict.get(table) if max_rows_dict else None
 
-                # Determine status based on row count and thresholds
-                if count == 0:
-                    status = "Empty"
-                elif min_rows is not None and count < min_rows:
-                    status = "Warn-LowCount"
-                elif max_rows is not None and count > max_rows:
-                    status = "Warn-HighCount"
-                else:
-                    status = "OK"
+                # First check if column monitoring is enabled for this table
+                has_column_conditions = False
+                column_results = {}
+                try:
+                    column_configs = load_column_config(db, table)
+                    has_column_conditions = not column_configs.empty
+
+                    if has_column_conditions:
+                        # Check column conditions if configurations exist
+                        column_results = check_column_conditions(
+                            db, table, column_configs.to_dict('records'))
+                        # Check if any column conditions failed
+                        failed_conditions = [
+                            col for col, result in column_results.items() if not result]
+                        if failed_conditions:
+                            status = f"Error: Column conditions not met for {', '.join(failed_conditions)}"
+                        else:
+                            # If column monitoring is enabled and all conditions are met, show OK status
+                            status = "OK"
+                    else:
+                        # Determine status based on row count and thresholds if no column monitoring
+                        if count == 0:
+                            status = "Empty"
+                        elif min_rows is not None and count < min_rows:
+                            status = "Warn-LowCount"
+                        elif max_rows is not None and count > max_rows:
+                            status = "Warn-HighCount"
+                        else:
+                            status = "OK"
+                except Exception as e:
+                    # If there's an error loading column config, fall back to row count checks
+                    print(
+                        f"Error checking column conditions for {db}.{table}: {str(e)}")
+                    if count == 0:
+                        status = "Empty"
+                    elif min_rows is not None and count < min_rows:
+                        status = "Warn-LowCount"
+                    elif max_rows is not None and count > max_rows:
+                        status = "Warn-HighCount"
+                    else:
+                        status = "OK"
 
                 results.append({
                     "Database": db,
@@ -82,7 +115,8 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
                     "Rows": str(count),
                     "Status": status,
                     "Min Rows": str(min_rows) if min_rows is not None else "None",
-                    "Max Rows": str(max_rows) if max_rows is not None else "None"
+                    "Max Rows": str(max_rows) if max_rows is not None else "None",
+                    "Column Conditions": column_results
                 })
             except Exception as e:
                 results.append({
@@ -91,7 +125,8 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
                     "Rows": "-",
                     "Status": f"Error: {str(e)}",
                     "Min Rows": "None",
-                    "Max Rows": "None"
+                    "Max Rows": "None",
+                    "Column Conditions": {}
                 })
     finally:
         cursor.close()
@@ -532,3 +567,79 @@ def get_job_duration_stats(job_name, sample_size=10):
 
     finally:
         cursor.close()
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_table_columns(db, table):
+    conn = get_connection(db)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"""
+            SELECT COLUMN_NAME, DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = ?
+        """, [table])
+        return [{"name": row[0], "type": row[1]} for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+
+
+def check_column_conditions(db, table, column_configs):
+    """
+    Check if table data meets the column conditions
+    Returns: dict with column names as keys and boolean results as values
+    """
+    if not column_configs:
+        return {}
+
+    conn = get_connection(db)
+    cursor = conn.cursor()
+    results = {}
+
+    try:
+        for config in column_configs:
+            column = config["column_name"]
+            cond_type = config["condition_type"]
+            value = config["condition_value"]
+
+            # Build the WHERE clause based on condition type
+            if cond_type == "equals":
+                where_clause = f"{column} = ?"
+            elif cond_type == "not_equals":
+                where_clause = f"{column} <> ?"
+            elif cond_type == "greater_than":
+                where_clause = f"{column} > ?"
+            elif cond_type == "less_than":
+                where_clause = f"{column} < ?"
+            elif cond_type == "in":
+                values = [v.strip() for v in value.split(",")]
+                placeholders = ",".join("?" * len(values))
+                where_clause = f"{column} IN ({placeholders})"
+            else:
+                continue
+
+            # Count rows that meet the condition
+            query = f"SELECT COUNT(*) FROM [{table}] WHERE {where_clause}"
+
+            try:
+                if cond_type == "in":
+                    cursor.execute(query, values)
+                else:
+                    cursor.execute(query, [value])
+
+                count = cursor.fetchone()[0]
+                total_query = f"SELECT COUNT(*) FROM [{table}]"
+                cursor.execute(total_query)
+                total = cursor.fetchone()[0]
+
+                # A condition is considered met if all rows satisfy it
+                results[column] = count == total
+
+            except Exception as e:
+                print(f"Error checking condition for {column}: {str(e)}")
+                results[column] = False
+
+    finally:
+        cursor.close()
+
+    return results
