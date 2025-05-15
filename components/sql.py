@@ -3,6 +3,39 @@ import pyodbc
 import pandas as pd
 from datetime import datetime, timedelta
 import os
+import time
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def retry_on_connection_error(max_retries=3, delay=1):
+    """Decorator to retry database operations on connection errors"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except pyodbc.Error as e:
+                    if isinstance(e, pyodbc.OperationalError) and e.args[0] == '08S01':
+                        retries += 1
+                        if retries == max_retries:
+                            logger.error(
+                                f"Failed to execute {func.__name__} after {max_retries} retries: {str(e)}")
+                            raise
+                        logger.warning(
+                            f"Connection error in {func.__name__}, retrying ({retries}/{max_retries})")
+                        time.sleep(delay * retries)  # Exponential backoff
+                    else:
+                        logger.error(
+                            f"Database error in {func.__name__}: {str(e)}")
+                        raise
+            return None
+        return wrapper
+    return decorator
 
 
 def get_windows_user():
@@ -20,17 +53,22 @@ def get_connection(db=None):
             "KeepAlive=30;"  # Send keep-alive probe every 30 seconds of inactivity
             # Interval in seconds between keep-alive retransmissions if no response
             "KeepAliveInterval=1;"
+            "Connection Timeout=30;"  # Added connection timeout
+            "ConnectRetryCount=3;"    # Added retry count
+            "ConnectRetryInterval=1;"  # Added retry interval
         )
         if db:
             conn_str += f"DATABASE={db};"
         conn = pyodbc.connect(conn_str)
         return conn  # Ensure only the connection object is returned
     except pyodbc.Error as e:
-        print(f"Connection Error on DB {db if db else 'default'}: {str(e)}")
+        logger.error(
+            f"Connection Error on DB {db if db else 'default'}: {str(e)}")
         raise
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_databases():
     conn = get_connection()  # Updated to expect a single connection object
     cursor = conn.cursor()
@@ -41,6 +79,7 @@ def get_databases():
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_tables(db):
     conn = get_connection(db)  # Updated
     cursor = conn.cursor()
@@ -52,6 +91,7 @@ def get_tables(db):
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
     results = []
     conn = get_connection(db)  # Updated
@@ -99,6 +139,7 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_table_size_info(db, table_name):
     conn = get_connection(db)
     cursor = conn.cursor()
@@ -124,13 +165,15 @@ def get_table_size_info(db, table_name):
         return {"data_kb": 0, "index_kb": 0}
     except pyodbc.Error as e:
         # Handle cases where the table might not exist or other SQL errors
-        print(f"Error getting size for table {db}.{table_name}: {str(e)}")
+        logger.error(
+            f"Error getting size for table {db}.{table_name}: {str(e)}")
         return {"data_kb": 0, "index_kb": 0}  # Return default/error state
     finally:
         cursor.close()
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_job_history(hours_back=24, detect_anomalies=True):
     conn = get_connection('msdb')  # Updated
     cursor = conn.cursor()
@@ -237,6 +280,7 @@ def get_job_history(hours_back=24, detect_anomalies=True):
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_job_details(job_name):
     conn = get_connection('msdb')  # Updated
     cursor = conn.cursor()
@@ -279,6 +323,7 @@ def get_job_details(job_name):
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_job_steps(job_name):
     conn = get_connection('msdb')  # Updated
     cursor = conn.cursor()
@@ -366,6 +411,7 @@ def get_excluded_jobs():
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_all_jobs():
     conn = get_connection('msdb')  # Updated
     cursor = conn.cursor()
@@ -436,6 +482,7 @@ def get_all_jobs():
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_active_jobs():
     conn = get_connection('msdb')  # Updated
     cursor = conn.cursor()
@@ -448,8 +495,8 @@ def get_active_jobs():
             j.name AS job_name,
             ja.start_execution_date,
             DATEDIFF(MINUTE, ja.start_execution_date, GETDATE()) as duration_minutes,
-            h.step_id as current_step,
-            s.step_name
+            COALESCE(h.step_id, 0) as current_step,
+            COALESCE(s.step_name, 'Starting') as step_name
         FROM sysjobs j 
         INNER JOIN sysjobactivity ja ON j.job_id = ja.job_id
         LEFT JOIN sysjobhistory h ON j.job_id = h.job_id 
@@ -475,8 +522,9 @@ def get_active_jobs():
                 'Job Name': row[0],
                 'Start Time': row[1].strftime('%Y-%m-%d %H:%M:%S') if row[1] else '',
                 'Duration (mins)': row[2] if row[2] else 0,
-                'Current Step': row[3] if row[3] else 0,
-                'Step Name': row[4] if row[4] else ''
+                # Convert to string and ensure consistent type
+                'Current Step': str(row[3]) if pd.notna(row[3]) else '0',
+                'Step Name': row[4] or 'Starting'
             })
 
         return pd.DataFrame(results)
@@ -485,6 +533,7 @@ def get_active_jobs():
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
+@retry_on_connection_error()
 def get_job_duration_stats(job_name, sample_size=10):
     conn = get_connection('msdb')
     cursor = conn.cursor()

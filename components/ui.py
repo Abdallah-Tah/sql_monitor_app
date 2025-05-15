@@ -543,15 +543,20 @@ def render_dashboard_view():
     active_jobs = get_active_jobs()
     job_history = get_job_history(24)  # Last 24 hours
 
-    # Job Statistics
+    # Job Statistics - Updated to only count monitored jobs
     monitored_jobs = all_jobs[all_jobs['Job Name'].isin(
         saved_jobs['job_name'])] if not saved_jobs.empty else pd.DataFrame()
-    running_jobs = len(active_jobs) if not active_jobs.empty else 0
+    running_jobs = len(active_jobs[active_jobs['Job Name'].isin(
+        saved_jobs['job_name'])]) if not active_jobs.empty else 0
 
-    if not job_history.empty:
-        recent_failed = len(job_history[job_history['Status'] == 'Failed'])
+    if not job_history.empty and not saved_jobs.empty:
+        # Filter job history to only include monitored jobs
+        monitored_history = job_history[job_history['Job Name'].isin(
+            saved_jobs['job_name'])]
+        recent_failed = len(
+            monitored_history[monitored_history['Status'] == 'Failed'])
         recent_succeeded = len(
-            job_history[job_history['Status'] == 'Succeeded'])
+            monitored_history[monitored_history['Status'] == 'Succeeded'])
     else:
         recent_failed = 0
         recent_succeeded = 0
@@ -628,16 +633,35 @@ def render_dashboard_view():
     st.markdown("---")
     st.markdown("### 🔄 Currently Running Jobs")
     if not active_jobs.empty:
-        for _, job in active_jobs.iterrows():
-            with st.container():
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.markdown(f"**{job['Job Name']}**")
-                    st.text(f"Step: {job['Step Name'] or 'N/A'}")
-                with col2:
-                    st.markdown(f"Duration: {job['Duration (mins)']} mins")
+        # Filter to only show monitored jobs
+        if not saved_jobs.empty:
+            active_jobs = active_jobs[active_jobs['Job Name'].isin(
+                saved_jobs['job_name'])]
+
+        if not active_jobs.empty:
+            for _, job in active_jobs.iterrows():
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.markdown(f"**{job['Job Name']}**")
+                        # Handle step information more safely
+                        current_step = '0'
+                        step_name = 'Starting'
+
+                        if 'Current Step' in job and pd.notna(job['Current Step']):
+                            current_step = str(job['Current Step'])
+                        if 'Step Name' in job and pd.notna(job['Step Name']):
+                            step_name = job['Step Name']
+
+                        st.text(f"Step {current_step}: {step_name}")
+                    with col2:
+                        duration = job['Duration (mins)'] if 'Duration (mins)' in job and pd.notna(
+                            job['Duration (mins)']) else 0
+                        st.markdown(f"Duration: {duration} mins")
+        else:
+            st.info("No monitored jobs are currently running")
     else:
-        st.info("No jobs currently running")
+        st.info("No jobs are currently running")
 
     # Recent Problems Section
     st.markdown("---")
@@ -842,8 +866,10 @@ def get_latest_table_results():
             # Get table specific thresholds
             table_min = row['min_rows'] if pd.notna(row['min_rows']) else None
             table_max = row['max_rows'] if pd.notna(row['max_rows']) else None
-            table_min_dict = {row['table_name']: table_min} if table_min is not None else {}
-            table_max_dict = {row['table_name']: table_max} if table_max is not None else {}
+            table_min_dict = {row['table_name']
+                : table_min} if table_min is not None else {}
+            table_max_dict = {row['table_name']
+                : table_max} if table_max is not None else {}
 
             check_result_df = check_selected_tables(
                 row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
