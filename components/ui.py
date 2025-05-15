@@ -730,39 +730,44 @@ def render_alert_log():
         display_df['alert_time'] = pd.to_datetime(
             display_df['alert_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        # Rename columns for better display
-        display_df = display_df.rename(columns={
-            'alert_time': 'Time',
-            'alert_type': 'Type',
-            'source_type': 'Source Type',
-            'source_name': 'Source',
-            'status': 'Status',
-            'message': 'Message'
-        })
+        # First ensure we have all the required columns
+        required_columns = ['id', 'alert_time', 'alert_type',
+                            'source_type', 'source_name', 'status', 'message']
+        if all(col in display_df.columns for col in required_columns):
+            # Display the alert log with original column names
+            display_df = display_df[required_columns].copy()
 
-        # Display the alert log
-        st.dataframe(
-            apply_status_colors(
-                display_df[['Time', 'Type', 'Source Type', 'Source', 'Status', 'Message']], 'Status'),
-            use_container_width=True
-        )
+            # Then rename the columns
+            display_df.columns = ['ID', 'Time', 'Type',
+                                  'Source Type', 'Source', 'Status', 'Message']
 
-        # Allow user to view details for a specific alert
-        if 'details' in alerts.columns and not all(alerts['details'].isna()):
-            alert_ids = alerts['id'].tolist()
-            selected_alert = st.selectbox(
-                "View Alert Details",
-                ["Select an alert..."] + alert_ids,
-                format_func=lambda x: f"Alert #{x}" if isinstance(
-                    x, int) else x
+            # Display the formatted DataFrame
+            st.dataframe(
+                apply_status_colors(display_df, 'Status'),
+                use_container_width=True
             )
 
-            if selected_alert != "Select an alert...":
-                alert_details = alerts[alerts['id'] ==
-                                       selected_alert]['details'].iloc[0]
-                if alert_details:
-                    with st.expander("Alert Details", expanded=True):
-                        st.text(alert_details)
+            # Allow user to view details for a specific alert
+            if 'details' in alerts.columns and not all(alerts['details'].isna()):
+                alert_ids = alerts['id'].tolist()
+                selected_alert = st.selectbox(
+                    "View Alert Details",
+                    ["Select an alert..."] + alert_ids,
+                    format_func=lambda x: f"Alert #{x}" if isinstance(
+                        x, int) else x
+                )
+
+                if selected_alert != "Select an alert...":
+                    alert_details = alerts[alerts['id'] ==
+                                           selected_alert]['details'].iloc[0]
+                    if alert_details:
+                        with st.expander("Alert Details", expanded=True):
+                            st.text(alert_details)
+        else:
+            missing_columns = [
+                col for col in required_columns if col not in display_df.columns]
+            st.error(
+                f"Missing required columns in alert data: {', '.join(missing_columns)}")
 
 
 def init_session_state():
@@ -810,6 +815,24 @@ def render_ui():
         render_config_view()
 
 
+def render_config_view():
+    st.header("⚙️ Configuration")
+
+    tab1, tab2, tab3 = st.tabs(
+        ["📊 Table Monitor", "🔄 Job Monitor", "🚨 Alert Log"])
+
+    with tab1:
+        table_results = render_table_monitor()
+        st.session_state.table_results = table_results
+
+    with tab2:
+        job_results = render_job_monitor()
+        st.session_state.job_results = job_results
+
+    with tab3:
+        render_alert_log()
+
+
 def get_latest_table_results():
     saved_tables = load_saved_table_config()
     results = []
@@ -819,8 +842,8 @@ def get_latest_table_results():
             # Get table specific thresholds
             table_min = row['min_rows'] if pd.notna(row['min_rows']) else None
             table_max = row['max_rows'] if pd.notna(row['max_rows']) else None
-            table_min_dict = {row['table_name']                              : table_min} if table_min is not None else {}
-            table_max_dict = {row['table_name']                              : table_max} if table_max is not None else {}
+            table_min_dict = {row['table_name']: table_min} if table_min is not None else {}
+            table_max_dict = {row['table_name']: table_max} if table_max is not None else {}
 
             check_result_df = check_selected_tables(
                 row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
