@@ -16,6 +16,7 @@ def init_db():
             table_name TEXT NOT NULL,
             min_rows INTEGER DEFAULT NULL,
             max_rows INTEGER DEFAULT NULL,
+            column_min_match_count INTEGER DEFAULT 1, -- Added new column
             UNIQUE(db_name, table_name)
         );
         """))
@@ -81,7 +82,12 @@ def update_db_schema():
     db_file = os.path.join(os.path.dirname(
         os.path.dirname(__file__)), "data", "job_monitor.db")
     if not os.path.exists(db_file):
-        return
+        init_db()  # Ensure DB and tables are created if db file doesn't exist
+        # Re-connect after init_db creates the file
+        if not os.path.exists(db_file):  # Still doesn't exist, something is wrong
+            print(
+                f"ERROR: Database file {db_file} could not be created by init_db().")
+            return
 
     conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
@@ -110,7 +116,7 @@ def update_db_schema():
 
         conn.commit()
 
-    # Also run the same existing logic for table_monitor_config
+    # Update: Check and add columns for table_monitor_config
     cursor.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='table_monitor_config'")
     if cursor.fetchone():
@@ -123,26 +129,47 @@ def update_db_schema():
         if 'max_rows' not in columns:
             cursor.execute(
                 "ALTER TABLE table_monitor_config ADD COLUMN max_rows INTEGER DEFAULT NULL")
+        if 'column_min_match_count' not in columns:  # Add check for the new column
+            cursor.execute(
+                "ALTER TABLE table_monitor_config ADD COLUMN column_min_match_count INTEGER DEFAULT 1")
 
         conn.commit()
 
     conn.close()
 
 
-def save_table_config(db, tables, min_rows_dict=None, max_rows_dict=None):
+def save_table_config(db, tables, min_rows_dict=None, max_rows_dict=None, column_min_match_count_dict=None):
     with engine.begin() as conn:
         for table in tables:
             min_r = min_rows_dict.get(table) if min_rows_dict else None
             max_r = max_rows_dict.get(table) if max_rows_dict else None
+            # Get the min match count for the current table, default to 1 if not provided
+            min_match_c = column_min_match_count_dict.get(
+                table, 1) if column_min_match_count_dict else 1
+
+            # Ensure min_match_c is an int, handle None or non-int values if necessary
+            if not isinstance(min_match_c, int):
+                try:
+                    min_match_c = int(
+                        min_match_c) if min_match_c is not None else 1
+                except ValueError:
+                    min_match_c = 1  # Default if conversion fails
 
             conn.execute(text("""
-            INSERT OR REPLACE INTO table_monitor_config (db_name, table_name, min_rows, max_rows)
-            VALUES (:db, :table, :min_r, :max_r)
-            """), {"db": db, "table": table, "min_r": min_r, "max_r": max_r})
+            INSERT OR REPLACE INTO table_monitor_config 
+            (db_name, table_name, min_rows, max_rows, column_min_match_count)
+            VALUES (:db, :table, :min_r, :max_r, :min_match_c)
+            """), {
+                "db": db,
+                "table": table,
+                "min_r": min_r,
+                "max_r": max_r,
+                "min_match_c": min_match_c
+            })
 
 
 def load_saved_table_config():
-    return pd.read_sql("SELECT db_name, table_name, min_rows, max_rows FROM table_monitor_config", con=engine)
+    return pd.read_sql("SELECT db_name, table_name, min_rows, max_rows, column_min_match_count FROM table_monitor_config", con=engine)
 
 
 def log_table_check_result(db, table, count, status):

@@ -118,7 +118,7 @@ def get_tables(db):
 # Removed @st.cache_data decorator to prevent caching of database connections
 
 
-def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
+def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None, column_min_match_count_dict=None):
     if not tables:
         return pd.DataFrame([])
 
@@ -137,6 +137,8 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
 
                 min_rows = min_rows_dict.get(table) if min_rows_dict else None
                 max_rows = max_rows_dict.get(table) if max_rows_dict else None
+                min_match_count_for_column_conditions = column_min_match_count_dict.get(
+                    table, 1) if column_min_match_count_dict else 1
 
                 # Determine status based on row count thresholds first
                 if count == 0:
@@ -148,6 +150,40 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
                 else:
                     status = "OK"
 
+                # Check column conditions if configured
+                column_conditions_met = True  # Assume true if no conditions or all met
+                column_condition_details = {}
+                # Load column configurations for the current table
+                table_column_configs_df = load_column_config(db, table)
+                if not table_column_configs_df.empty:
+                    # Convert DataFrame to list of dicts for check_column_conditions
+                    table_column_configs_list = table_column_configs_df.to_dict(
+                        'records')
+                    column_condition_results = check_column_conditions(
+                        db, table, table_column_configs_list, min_match_count_for_column_conditions)
+
+                    column_condition_details = column_condition_results  # Store detailed results
+                    # Overall status based on column conditions
+                    # For UploadLogs, it's if ANY condition set (e.g. status+date) is met.
+                    # For others, it's if ALL configured conditions are met.
+                    if table == "UploadLogs":
+                        # If any condition (or combined set) is true, it's met.
+                        # The check_column_conditions for UploadLogs returns True for a column if its specific rule (or combined rule) is met.
+                        # So, if any of the results are True, the overall column condition is considered met for UploadLogs.
+                        column_conditions_met = any(
+                            column_condition_results.values())
+                    else:
+                        # For other tables, all individual conditions must be met.
+                        column_conditions_met = all(
+                            column_condition_results.values())
+
+                    if not column_conditions_met and status == "OK":  # Only override if row count was OK
+                        status = "Warn-ColumnConditionNotMet"
+                    elif column_conditions_met and status == "OK":
+                        status = "OK-ColumnConditionMet"  # More specific OK status
+                    elif not column_conditions_met and status.startswith("Warn"):
+                        status += ";ColCondNotMet"  # Append to existing warning
+
                 results.append({
                     "Database": db,
                     "Table": table,
@@ -155,7 +191,7 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
                     "Status": status,
                     "Min Rows": str(min_rows) if min_rows is not None else "None",
                     "Max Rows": str(max_rows) if max_rows is not None else "None",
-                    "Column Conditions": {}
+                    "Column Conditions": column_condition_details  # Store detailed results
                 })
             except Exception as e:
                 print(f"Error checking table {db}.{table}: {str(e)}")
@@ -722,18 +758,26 @@ def get_table_columns(db, table):
                 pass
 
 
-def check_column_conditions(db, table, column_configs):
+def check_column_conditions(db, table, column_configs, min_match_count=1):
     """
-    Check if table data meets the column conditions
-    Returns: dict with column names as keys and boolean results as values
+    Check if table data meets the column conditions.
+    Returns: dict with column names as keys and boolean results (met/not met) as values.
+             For UploadLogs, a combined condition (e.g. status & date) will update results for both involved columns.
+             For other tables, it checks if at least min_match_count rows satisfy ALL combined conditions.
     """
     if not column_configs:
         return {}
 
-    results = {}
+    # Initialize all to False
+    results = {config["column_name"]: False for config in column_configs}
+    conn = None
+    cursor = None
 
     try:
-        # Special handling for UploadLogs table
+        conn = get_connection(db)
+        cursor = conn.cursor()
+
+        # Special handling for UploadLogs table (checks for existence of ANY matching row)
         if table == "UploadLogs":
             # First check if we have both status and date conditions
             has_status = any(cfg["column_name"] ==
