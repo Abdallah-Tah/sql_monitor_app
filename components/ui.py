@@ -14,6 +14,7 @@ from components.db import (
     # Added imports
     delete_job_config, log_alert, get_alerts, save_column_config, load_column_config
 )
+from streamlit_autorefresh import st_autorefresh
 
 
 def apply_status_colors(df, status_column):
@@ -250,20 +251,27 @@ def render_table_monitor():
 
                                     condition = st.selectbox(
                                         "Condition",
-                                        options=["equals", "not_equals",
-                                                 "greater_than", "less_than", "in"],
-                                        index=["equals", "not_equals", "greater_than", "less_than", "in"].index(
+                                        options=["equals", "not_equals", "greater_than",
+                                                 "less_than", "in", "date_equals_today",
+                                                 "date_greater_than", "date_less_than"],
+                                        index=["equals", "not_equals", "greater_than",
+                                               "less_than", "in", "date_equals_today",
+                                               "date_greater_than", "date_less_than"].index(
                                             existing_col_config["condition_type"]) if existing_col_config is not None else 0,
                                         key=f"condition_{table}_{col}"
                                     )
 
-                                    value = st.text_input(
-                                        "Value" +
-                                        (" (comma-separated for IN)" if condition ==
-                                         "in" else ""),
-                                        value=existing_col_config["condition_value"] if existing_col_config is not None else "",
-                                        key=f"value_{table}_{col}"
-                                    )
+                                    # Show value input only for non-date_equals_today condition
+                                    if condition != "date_equals_today":
+                                        value = st.text_input(
+                                            "Value" +
+                                            (" (comma-separated for IN)" if condition == "in" else
+                                             " (YYYY-MM-DD for date conditions)" if condition.startswith("date_") else ""),
+                                            value=existing_col_config["condition_value"] if existing_col_config is not None else "",
+                                            key=f"value_{table}_{col}"
+                                        )
+                                    else:
+                                        value = "CURRENT_DATE"  # Special value for date_equals_today
 
                                     if value:  # Only add configuration if a value is provided
                                         column_configs.append({
@@ -407,7 +415,8 @@ def render_job_details(job_name):
         with col2:
             st.markdown("#### Job Steps")
             steps_df = get_job_steps(job_name)
-            if not steps_df.empty:
+            # Check if steps_df is a DataFrame and not empty
+            if isinstance(steps_df, pd.DataFrame) and not steps_df.empty:
                 st.dataframe(apply_status_colors(
                     steps_df, 'Last Status'), use_container_width=True)
             else:
@@ -595,17 +604,35 @@ def render_job_monitor():
 
 
 def render_dashboard_view():
-    # Show last refresh time and manual refresh button
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.markdown(
-            f"Last updated: {st.session_state.last_refresh.strftime('%Y-%m-%d %H:%M:%S')}")
-    with col2:
-        if st.button("🔄 Refresh Data"):
-            st.session_state.last_refresh = datetime.now()
-            st.session_state.refresh_counter += 1
-            st.cache_data.clear()
-            st.experimental_rerun()
+    # --- Auto-refresh interval configuration ---
+    if 'refresh_interval' not in st.session_state:
+        st.session_state.refresh_interval = 5  # default 5 seconds
+    col_refresh, _, _ = st.columns([1, 1, 8])
+    with col_refresh:
+        refresh_interval = st.number_input(
+            "Auto-refresh interval (seconds)",
+            min_value=1,
+            max_value=3600,
+            value=st.session_state.refresh_interval,
+            step=1,
+            key="refresh_interval_input"
+        )
+        st.session_state.refresh_interval = refresh_interval
+
+    st_autorefresh(interval=st.session_state.refresh_interval *
+                   1000, key="dashboard_autorefresh")
+
+    # --- Professional Last Updated Display ---
+    last_updated_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    st.markdown(f"""
+        <div style='display: flex; align-items: center; margin-bottom: 0.5rem;'>
+            <span style='font-size: 1.2rem; color: #888; font-weight: 500; margin-right: 0.5rem;'>🕒 Last updated:</span>
+            <span style='font-size: 1.3rem; color: #2b9348; font-weight: bold;'>{last_updated_time}</span>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # --- Removed countdown and auto-refresh info for silent refresh ---
+    # Keep the rest of the dashboard as is
 
     st.markdown("""
         <style>
@@ -633,15 +660,20 @@ def render_dashboard_view():
     active_jobs = get_active_jobs()
     job_history = get_job_history(24)  # Last 24 hours
 
-    # Job Statistics
+    # Job Statistics - Updated to only count monitored jobs
     monitored_jobs = all_jobs[all_jobs['Job Name'].isin(
         saved_jobs['job_name'])] if not saved_jobs.empty else pd.DataFrame()
-    running_jobs = len(active_jobs) if not active_jobs.empty else 0
+    running_jobs = len(active_jobs[active_jobs['Job Name'].isin(
+        saved_jobs['job_name'])]) if not active_jobs.empty else 0
 
-    if not job_history.empty:
-        recent_failed = len(job_history[job_history['Status'] == 'Failed'])
+    if not job_history.empty and not saved_jobs.empty:
+        # Filter job history to only include monitored jobs
+        monitored_history = job_history[job_history['Job Name'].isin(
+            saved_jobs['job_name'])]
+        recent_failed = len(
+            monitored_history[monitored_history['Status'] == 'Failed'])
         recent_succeeded = len(
-            job_history[job_history['Status'] == 'Succeeded'])
+            monitored_history[monitored_history['Status'] == 'Succeeded'])
     else:
         recent_failed = 0
         recent_succeeded = 0
@@ -718,16 +750,35 @@ def render_dashboard_view():
     st.markdown("---")
     st.markdown("### 🔄 Currently Running Jobs")
     if not active_jobs.empty:
-        for _, job in active_jobs.iterrows():
-            with st.container():
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.markdown(f"**{job['Job Name']}**")
-                    st.text(f"Step: {job['Step Name'] or 'N/A'}")
-                with col2:
-                    st.markdown(f"Duration: {job['Duration (mins)']} mins")
+        # Filter to only show monitored jobs
+        if not saved_jobs.empty:
+            active_jobs = active_jobs[active_jobs['Job Name'].isin(
+                saved_jobs['job_name'])]
+
+        if not active_jobs.empty:
+            for _, job in active_jobs.iterrows():
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.markdown(f"**{job['Job Name']}**")
+                        # Handle step information more safely
+                        current_step = '0'
+                        step_name = 'Starting'
+
+                        if 'Current Step' in job and pd.notna(job['Current Step']):
+                            current_step = str(job['Current Step'])
+                        if 'Step Name' in job and pd.notna(job['Step Name']):
+                            step_name = job['Step Name']
+
+                        st.text(f"Step {current_step}: {step_name}")
+                    with col2:
+                        duration = job['Duration (mins)'] if 'Duration (mins)' in job and pd.notna(
+                            job['Duration (mins)']) else 0
+                        st.markdown(f"Duration: {duration} mins")
+        else:
+            st.info("No monitored jobs are currently running")
     else:
-        st.info("No jobs currently running")
+        st.info("No jobs are currently running")
 
     # Recent Problems Section
     st.markdown("---")
@@ -875,6 +926,10 @@ def init_session_state():
         st.session_state.last_refresh = datetime.now()
     if 'refresh_counter' not in st.session_state:
         st.session_state.refresh_counter = 0
+    if 'auto_refresh' not in st.session_state:
+        st.session_state.auto_refresh = False
+    if 'last_auto_refresh' not in st.session_state:
+        st.session_state.last_auto_refresh = time.time()
 
 
 def render_ui():
@@ -933,24 +988,57 @@ def get_latest_table_results():
 
     if not saved_tables.empty:
         for _, row in saved_tables.iterrows():
-            # Get table specific thresholds
-            table_min = row['min_rows'] if pd.notna(row['min_rows']) else None
-            table_max = row['max_rows'] if pd.notna(row['max_rows']) else None
-            table_min_dict = {row['table_name']
-                : table_min} if table_min is not None else {}
-            table_max_dict = {row['table_name']
-                : table_max} if table_max is not None else {}
+            try:
+                # Get table specific thresholds
+                table_min = row['min_rows'] if pd.notna(
+                    row['min_rows']) else None
+                table_max = row['max_rows'] if pd.notna(
+                    row['max_rows']) else None
+                table_min_dict = {
+                    row['table_name']: table_min} if table_min is not None else {}
+                table_max_dict = {
+                    row['table_name']: table_max} if table_max is not None else {}
 
-            check_result_df = check_selected_tables(
-                row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
-            count = 0
-            status = "Error"
-            if not check_result_df.empty:
-                count = int(
-                    check_result_df.iloc[0]["Rows"]) if check_result_df.iloc[0]["Rows"].isdigit() else 0
-                status = check_result_df.iloc[0]["Status"]
+                # Get table status
+                check_result_df = check_selected_tables(
+                    row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
 
-                # Log alerts for table issues
+                count = 0
+                status = "Error"
+                if not check_result_df.empty:
+                    count = int(
+                        check_result_df.iloc[0]["Rows"]) if check_result_df.iloc[0]["Rows"].isdigit() else 0
+                    status = check_result_df.iloc[0]["Status"]
+
+                # Get size info in a separate operation
+                size_info = get_table_size_info(
+                    row["db_name"], row["table_name"])
+                data_mb = size_info['data_kb'] / 1024
+                index_mb = size_info['index_kb'] / 1024
+                total_mb = data_mb + index_mb
+
+                results.append({
+                    'Database': row["db_name"],
+                    'Table': row["table_name"],
+                    'Row Count': count,
+                    'Status': status,
+                    'Min Rows': table_min if table_min is not None else "None",
+                    'Max Rows': table_max if table_max is not None else "None",
+                    'Data MB': round(data_mb, 2),
+                    'Index MB': round(index_mb, 2),
+                    'Total MB': round(total_mb, 2),
+                    'Last Check': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+
+                # Log check result to table_check_log
+                log_table_check_result(
+                    row["db_name"],
+                    row["table_name"],
+                    count,
+                    status
+                )
+
+                # Log alerts for table issues if needed
                 if status != "OK":
                     source_type = ""
                     if status == "Empty":
@@ -980,32 +1068,10 @@ def get_latest_table_results():
                             message=f"Table {row['db_name']}.{row['table_name']} has {status} status",
                             details=details
                         )
-
-            size_info = get_table_size_info(row["db_name"], row["table_name"])
-            data_mb = size_info['data_kb'] / 1024
-            index_mb = size_info['index_kb'] / 1024
-            total_mb = data_mb + index_mb
-
-            results.append({
-                'Database': row["db_name"],
-                'Table': row["table_name"],
-                'Row Count': count,
-                'Status': status,
-                'Min Rows': table_min if table_min is not None else "None",
-                'Max Rows': table_max if table_max is not None else "None",
-                'Data MB': round(data_mb, 2),
-                'Index MB': round(index_mb, 2),
-                'Total MB': round(total_mb, 2),
-                'Last Check': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            })
-
-            # Log check result to table_check_log
-            log_table_check_result(
-                row["db_name"],
-                row["table_name"],
-                count,
-                status
-            )
+            except Exception as e:
+                print(
+                    f"Error processing table {row['db_name']}.{row['table_name']}: {str(e)}")
+                continue
 
     return results
 

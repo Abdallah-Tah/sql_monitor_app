@@ -10,104 +10,143 @@ def get_windows_user():
     return os.getenv('USERNAME')
 
 
-@st.cache_resource  # Removed ttl=300, connection will be cached per session
+# Removed @st.cache_resource(ttl=300) to ensure a fresh connection is always provided
 def get_connection(db=None):
+    """Get a database connection. Each call returns a new connection to avoid sharing cached closed connections."""
+    conn = None  # Initialize conn
     try:
+        # Simplified connection string for diagnostics
         conn_str = (
             "DRIVER={ODBC Driver 17 for SQL Server};"
             "SERVER=10.1.1.88;"
             "Trusted_Connection=yes;"
-            "TrustServerCertificate=yes;"
-            "KeepAlive=30;"  # Send keep-alive probe every 30 seconds of inactivity
-            # Interval in seconds between keep-alive retransmissions if no response
-            "KeepAliveInterval=1;"
+            # "TrustServerCertificate=yes;" # Temporarily removed
+            # "KeepAlive=30;" # Temporarily removed
+            # "KeepAliveInterval=1;" # Temporarily removed
         )
         if db:
             conn_str += f"DATABASE={db};"
+
+        # DEBUG
+        print(
+            f"DEBUG: Attempting to connect with simplified string: {conn_str}")
         conn = pyodbc.connect(conn_str)
-        return conn  # Ensure only the connection object is returned
+        # DEBUG
+        print(f"DEBUG: Connected with simplified string. conn object: {conn}")
+
+        # Test the newly created connection
+        try:
+            print(f"DEBUG: Testing connection {conn}")  # DEBUG
+            with conn.cursor() as test_cursor:
+                test_cursor.execute("SELECT 1")
+            print(f"DEBUG: Connection test PASSED for {conn}")  # DEBUG
+        except pyodbc.Error as test_e:
+            # DEBUG
+            print(
+                f"DEBUG: Connection test FAILED for {conn} (simplified string): {test_e}")
+            if conn:
+                try:
+                    conn.close()
+                except pyodbc.Error:
+                    pass
+            raise  # Re-raise the error from the connection test
+
+        # DEBUG
+        print(f"DEBUG: Returning OPEN connection from get_connection: {conn}")
+        return conn  # Return the tested, open connection
+
     except pyodbc.Error as e:
-        print(f"Connection Error on DB {db if db else 'default'}: {str(e)}")
+        # DEBUG
+        print(
+            f"DEBUG: Connection Error in get_connection (simplified string) for DB '{db if db else 'default'}': {str(e)}")
+        if conn:  # If connection object exists, try to close it
+            try:
+                conn.close()
+            except pyodbc.Error as close_e:
+                # DEBUG
+                print(
+                    f"DEBUG: Error closing connection in except block: {close_e}")
         raise
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_databases():
-    conn = get_connection()  # Updated to expect a single connection object
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sys.databases WHERE database_id > 4")
-    result = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    return result
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()  # Updated to expect a single connection object
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sys.databases WHERE database_id > 4")
+        result = [row[0] for row in cursor.fetchall()]
+        return result
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass  # Optionally log error
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass  # Optionally log error
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_tables(db):
-    conn = get_connection(db)  # Updated
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'")
-    result = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    return result
-
-
-@st.cache_data(ttl=300)  # Cache for 5 minutes
-def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
-    results = []
-    conn = get_connection(db)
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection(db)  # Updated
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'")
+        result = [row[0] for row in cursor.fetchall()]
+        return result
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
+
+# Removed @st.cache_data decorator to prevent caching of database connections
+
+
+def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
+    if not tables:
+        return pd.DataFrame([])
+
+    results = []
+    conn = None
+    cursor = None
+
+    try:
+        conn = get_connection(db)
+        cursor = conn.cursor()
+
         for table in tables:
             try:
                 cursor.execute(f"SELECT COUNT(*) FROM [{table}]")
                 count = cursor.fetchone()[0]
 
-                # Get thresholds for this table
                 min_rows = min_rows_dict.get(table) if min_rows_dict else None
                 max_rows = max_rows_dict.get(table) if max_rows_dict else None
 
-                # First check if column monitoring is enabled for this table
-                has_column_conditions = False
-                column_results = {}
-                try:
-                    column_configs = load_column_config(db, table)
-                    has_column_conditions = not column_configs.empty
-
-                    if has_column_conditions:
-                        # Check column conditions if configurations exist
-                        column_results = check_column_conditions(
-                            db, table, column_configs.to_dict('records'))
-                        # Check if any column conditions failed
-                        failed_conditions = [
-                            col for col, result in column_results.items() if not result]
-                        if failed_conditions:
-                            status = f"Error: Column conditions not met for {', '.join(failed_conditions)}"
-                        else:
-                            # If column monitoring is enabled and all conditions are met, show OK status
-                            status = "OK"
-                    else:
-                        # Determine status based on row count and thresholds if no column monitoring
-                        if count == 0:
-                            status = "Empty"
-                        elif min_rows is not None and count < min_rows:
-                            status = "Warn-LowCount"
-                        elif max_rows is not None and count > max_rows:
-                            status = "Warn-HighCount"
-                        else:
-                            status = "OK"
-                except Exception as e:
-                    # If there's an error loading column config, fall back to row count checks
-                    print(
-                        f"Error checking column conditions for {db}.{table}: {str(e)}")
-                    if count == 0:
-                        status = "Empty"
-                    elif min_rows is not None and count < min_rows:
-                        status = "Warn-LowCount"
-                    elif max_rows is not None and count > max_rows:
-                        status = "Warn-HighCount"
-                    else:
-                        status = "OK"
+                # Determine status based on row count thresholds first
+                if count == 0:
+                    status = "Empty"
+                elif min_rows is not None and count < min_rows:
+                    status = "Warn-LowCount"
+                elif max_rows is not None and count > max_rows:
+                    status = "Warn-HighCount"
+                else:
+                    status = "OK"
 
                 results.append({
                     "Database": db,
@@ -116,9 +155,10 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
                     "Status": status,
                     "Min Rows": str(min_rows) if min_rows is not None else "None",
                     "Max Rows": str(max_rows) if max_rows is not None else "None",
-                    "Column Conditions": column_results
+                    "Column Conditions": {}
                 })
             except Exception as e:
+                print(f"Error checking table {db}.{table}: {str(e)}")
                 results.append({
                     "Database": db,
                     "Table": table,
@@ -129,15 +169,27 @@ def check_selected_tables(db, tables, min_rows_dict=None, max_rows_dict=None):
                     "Column Conditions": {}
                 })
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
     return pd.DataFrame(results)
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_table_size_info(db, table_name):
-    conn = get_connection(db)
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection(db)
+        cursor = conn.cursor()
         # Using sp_spaceused to get table size information
         # Ensure the database context is correct for sp_spaceused
         cursor.execute(f"USE {db};")
@@ -162,14 +214,25 @@ def get_table_size_info(db, table_name):
         print(f"Error getting size for table {db}.{table_name}: {str(e)}")
         return {"data_kb": 0, "index_kb": 0}  # Return default/error state
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=1)  # Cache for just 1 second to ensure fresh data
 def get_job_history(hours_back=24, detect_anomalies=True):
-    conn = get_connection('msdb')  # Updated
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection('msdb')  # Updated
+        cursor = conn.cursor()
         excluded_jobs = get_excluded_jobs()
         placeholders = ','.join('?' * len(excluded_jobs))
 
@@ -268,14 +331,25 @@ def get_job_history(hours_back=24, detect_anomalies=True):
 
         return pd.DataFrame(results)
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_job_details(job_name):
-    conn = get_connection('msdb')  # Updated
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection('msdb')  # Updated
+        cursor = conn.cursor()
         query = """
         SELECT 
             j.name AS job_name,
@@ -310,14 +384,25 @@ def get_job_details(job_name):
             }
         return None
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_job_steps(job_name):
-    conn = get_connection('msdb')  # Updated
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection('msdb')  # Updated
+        cursor = conn.cursor()
         query = """
         SELECT 
             s.step_id,
@@ -380,7 +465,16 @@ def get_job_steps(job_name):
 
         return pd.DataFrame(results)
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
 def get_excluded_jobs():
@@ -400,11 +494,13 @@ def get_excluded_jobs():
     ]
 
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=1)  # Cache for just 1 second to ensure fresh data
 def get_all_jobs():
-    conn = get_connection('msdb')  # Updated
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection('msdb')  # Updated
+        cursor = conn.cursor()
         excluded_jobs = get_excluded_jobs()
 
         placeholders = ','.join('?' * len(excluded_jobs))
@@ -467,14 +563,25 @@ def get_all_jobs():
 
         return pd.DataFrame(results)
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=1)  # Cache for just 1 second to ensure fresh data
 def get_active_jobs():
-    conn = get_connection('msdb')  # Updated
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection('msdb')  # Updated
+        cursor = conn.cursor()
         excluded_jobs = get_excluded_jobs()
         placeholders = ','.join('?' * len(excluded_jobs))
 
@@ -516,14 +623,25 @@ def get_active_jobs():
 
         return pd.DataFrame(results)
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_job_duration_stats(job_name, sample_size=10):
-    conn = get_connection('msdb')
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection('msdb')
+        cursor = conn.cursor()
         query = f"""
         SELECT TOP {sample_size}
             h.run_duration
@@ -566,14 +684,25 @@ def get_job_duration_stats(job_name, sample_size=10):
         }
 
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_table_columns(db, table):
-    conn = get_connection(db)
-    cursor = conn.cursor()
+    conn = None
+    cursor = None
     try:
+        conn = get_connection(db)
+        cursor = conn.cursor()
         cursor.execute(f"""
             SELECT COLUMN_NAME, DATA_TYPE
             FROM INFORMATION_SCHEMA.COLUMNS
@@ -581,7 +710,16 @@ def get_table_columns(db, table):
         """, [table])
         return [{"name": row[0], "type": row[1]} for row in cursor.fetchall()]
     finally:
-        cursor.close()
+        if cursor:
+            try:
+                cursor.close()
+            except pyodbc.Error:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
 
 
 def check_column_conditions(db, table, column_configs):
@@ -592,54 +730,185 @@ def check_column_conditions(db, table, column_configs):
     if not column_configs:
         return {}
 
-    conn = get_connection(db)
-    cursor = conn.cursor()
     results = {}
 
     try:
-        for config in column_configs:
-            column = config["column_name"]
-            cond_type = config["condition_type"]
-            value = config["condition_value"]
+        # Special handling for UploadLogs table
+        if table == "UploadLogs":
+            # First check if we have both status and date conditions
+            has_status = any(cfg["column_name"] ==
+                             "status" for cfg in column_configs)
+            has_date = any(cfg["column_name"].startswith("created_")
+                           for cfg in column_configs)
 
-            # Build the WHERE clause based on condition type
-            if cond_type == "equals":
-                where_clause = f"{column} = ?"
-            elif cond_type == "not_equals":
-                where_clause = f"{column} <> ?"
-            elif cond_type == "greater_than":
-                where_clause = f"{column} > ?"
-            elif cond_type == "less_than":
-                where_clause = f"{column} < ?"
-            elif cond_type == "in":
-                values = [v.strip() for v in value.split(",")]
-                placeholders = ",".join("?" * len(values))
-                where_clause = f"{column} IN ({placeholders})"
-            else:
-                continue
+            if has_status and has_date:
+                # Get the configurations
+                status_config = next(
+                    cfg for cfg in column_configs if cfg["column_name"] == "status")
+                date_config = next(
+                    cfg for cfg in column_configs if cfg["column_name"].startswith("created_"))
 
-            # Count rows that meet the condition
-            query = f"SELECT COUNT(*) FROM [{table}] WHERE {where_clause}"
+                # Build the combined query
+                where_clauses = []
+                all_params = []
 
-            try:
-                if cond_type == "in":
-                    cursor.execute(query, values)
+                # Add status condition
+                if status_config["condition_type"] == "in":
+                    status_values = [
+                        v.strip() for v in status_config["condition_value"].split(",")]
+                    status_placeholders = ",".join("?" * len(status_values))
+                    where_clauses.append(f"status IN ({status_placeholders})")
+                    all_params.extend(status_values)
                 else:
-                    cursor.execute(query, [value])
+                    where_clauses.append("status = ?")
+                    all_params.append(status_config["condition_value"])
 
-                count = cursor.fetchone()[0]
-                total_query = f"SELECT COUNT(*) FROM [{table}]"
-                cursor.execute(total_query)
-                total = cursor.fetchone()[0]
+                # Add date condition
+                if date_config["condition_type"] == "date_equals_today":
+                    where_clauses.append(
+                        "CAST(created_at AS DATE) = CAST(GETDATE() AS DATE)")
+                elif date_config["condition_type"] == "date_greater_than":
+                    where_clauses.append(
+                        "CAST(created_at AS DATE) > CAST(? AS DATE)")
+                    all_params.append(date_config["condition_value"])
+                elif date_config["condition_type"] == "date_less_than":
+                    where_clauses.append(
+                        "CAST(created_at AS DATE) < CAST(? AS DATE)")
+                    all_params.append(date_config["condition_value"])
 
-                # A condition is considered met if all rows satisfy it
-                results[column] = count == total
+                # Execute combined query
+                conn = get_connection(db)
+                cursor = conn.cursor()
+                try:
+                    combined_where = " AND ".join(where_clauses)
+                    query = f"SELECT COUNT(*) FROM [{table}] WHERE {combined_where}"
+                    cursor.execute(query, all_params)
+                    count = cursor.fetchone()[0]
+                    # Update results for both columns
+                    combined_result = count > 0
+                    results["status"] = combined_result
+                    results[date_config["column_name"]] = combined_result
+                except Exception as e:
+                    print(f"Error checking combined conditions: {str(e)}")
+                    results["status"] = False
+                    results[date_config["column_name"]] = False
+                finally:
+                    cursor.close()
+                    conn.close()
+            else:
+                # Handle individual conditions
+                for config in column_configs:
+                    conn = get_connection(db)
+                    cursor = conn.cursor()
+                    try:
+                        column = config["column_name"]
+                        cond_type = config["condition_type"]
+                        value = config["condition_value"]
 
+                        where_clause = ""
+                        params = []
+
+                        if cond_type == "equals":
+                            where_clause = f"{column} = ?"
+                            params = [value]
+                        elif cond_type == "not_equals":
+                            where_clause = f"{column} <> ?"
+                            params = [value]
+                        elif cond_type == "in":
+                            values = [v.strip() for v in value.split(",")]
+                            placeholders = ",".join("?" * len(values))
+                            where_clause = f"{column} IN ({placeholders})"
+                            params = values
+                        elif cond_type == "date_equals_today":
+                            where_clause = f"CAST({column} AS DATE) = CAST(GETDATE() AS DATE)"
+                            params = []
+                        elif cond_type == "date_greater_than":
+                            where_clause = f"CAST({column} AS DATE) > CAST(? AS DATE)"
+                            params = [value]
+                        elif cond_type == "date_less_than":
+                            where_clause = f"CAST({column} AS DATE) < CAST(? AS DATE)"
+                            params = [value]
+
+                        query = f"SELECT COUNT(*) FROM [{table}] WHERE {where_clause}"
+                        cursor.execute(query, params)
+                        count = cursor.fetchone()[0]
+                        results[column] = count > 0
+
+                    except Exception as e:
+                        print(
+                            f"Error checking condition for {config['column_name']}: {str(e)}")
+                        results[config["column_name"]] = False
+                    finally:
+                        cursor.close()
+                        conn.close()
+        else:
+            # Standard handling for other tables
+            conn = get_connection(db)
+            cursor = conn.cursor()
+            try:
+                where_clauses = []
+                all_params = []
+
+                for config in column_configs:
+                    column = config["column_name"]
+                    cond_type = config["condition_type"]
+                    value = config["condition_value"]
+
+                    if cond_type == "equals":
+                        where_clauses.append(f"{column} = ?")
+                        all_params.append(value)
+                    elif cond_type == "not_equals":
+                        where_clauses.append(f"{column} <> ?")
+                        all_params.append(value)
+                    elif cond_type == "in":
+                        values = [v.strip() for v in value.split(",")]
+                        placeholders = ",".join("?" * len(values))
+                        where_clauses.append(f"{column} IN ({placeholders})")
+                        all_params.extend(values)
+                    elif cond_type == "date_equals_today":
+                        where_clauses.append(
+                            f"CAST({column} AS DATE) = CAST(GETDATE() AS DATE)")
+                    elif cond_type == "date_greater_than":
+                        where_clauses.append(
+                            f"CAST({column} AS DATE) > CAST(? AS DATE)")
+                        all_params.append(value)
+                    elif cond_type == "date_less_than":
+                        where_clauses.append(
+                            f"CAST({column} AS DATE) < CAST(? AS DATE)")
+                        all_params.append(value)
+
+                if where_clauses:
+                    combined_where = " AND ".join(where_clauses)
+                    query = f"SELECT COUNT(*) FROM [{table}] WHERE {combined_where}"
+
+                    if all_params:
+                        cursor.execute(query, all_params)
+                    else:
+                        cursor.execute(query)
+
+                    count = cursor.fetchone()[0]
+                    cursor.close()
+
+                    total_query = f"SELECT COUNT(*) FROM [{table}]"
+                    cursor = conn.cursor()
+                    cursor.execute(total_query)
+                    total = cursor.fetchone()[0]
+
+                    # For other tables, condition is met if all rows satisfy it
+                    condition_met = count == total
+                    for config in column_configs:
+                        results[config["column_name"]] = condition_met
             except Exception as e:
-                print(f"Error checking condition for {column}: {str(e)}")
-                results[column] = False
+                print(f"Error checking conditions for {table}: {str(e)}")
+                for config in column_configs:
+                    results[config["column_name"]] = False
+            finally:
+                cursor.close()
+                conn.close()
 
-    finally:
-        cursor.close()
+    except Exception as e:
+        print(f"Error in check_column_conditions: {str(e)}")
+        for config in column_configs:
+            results[config["column_name"]] = False
 
     return results
