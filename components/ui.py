@@ -139,27 +139,62 @@ def show_notifications(table_results, job_results):
 def render_table_monitor():
     st.header("📊 Database Table Monitor")
 
+    # Handling edit state reset if user manually changes selection
+    # This might be better handled by how defaults are set or by a "Cancel Edit" button
+    current_table_db_selection = st.session_state.get("table_db_select")
+    current_table_selection = st.session_state.get("table_select")
+
+    if st.session_state.edit_trigger and \
+       (st.session_state.edit_selected_db != current_table_db_selection or
+            (current_table_selection is not None and st.session_state.edit_selected_tables != current_table_selection)):
+        # User manually changed selection after edit was triggered, so reset edit mode
+        # This logic is a bit complex due to widget state. Simpler to reset edit_trigger after one use.
+        pass
+
     col1, col2 = st.columns([2, 3])
 
     with col1:
         st.subheader("Configuration")
         dbs = get_databases()
+
+        db_default_index = 0
+        if st.session_state.edit_trigger and st.session_state.edit_selected_db and st.session_state.edit_selected_db in dbs:
+            db_default_index = dbs.index(st.session_state.edit_selected_db)
+
         selected_db = st.selectbox(
-            "Choose Database", dbs, key="table_db_select")
+            "Choose Database", dbs, key="table_db_select", index=db_default_index
+        )
 
         if selected_db:
             tables = get_tables(selected_db)
-            selected_tables = st.multiselect(
-                "Select Tables", tables, key="table_select")
+            table_default_selection = []
+            if st.session_state.edit_trigger and selected_db == st.session_state.edit_selected_db:
+                table_default_selection = [
+                    t for t in st.session_state.edit_selected_tables if t in tables]
+
+            # Use a different key for the multiselect if we are setting its value programmatically due to edit_trigger
+            # This helps Streamlit correctly update the widget.
+            multiselect_key = "table_select_edit" if st.session_state.edit_trigger and table_default_selection else "table_select"
+
+            selected_tables_val = st.multiselect(
+                "Select Tables", tables, key=multiselect_key, default=table_default_selection
+            )
+
+            # If edit was triggered, and we've now rendered the widgets with defaults, turn off the trigger.
+            if st.session_state.edit_trigger:
+                st.session_state.edit_trigger = False
+                # Force selected_tables to be what was intended by the edit action for this render pass
+                if selected_db == st.session_state.edit_selected_db:
+                    selected_tables_val = table_default_selection
 
             # For each selected table, show threshold configuration
             threshold_settings = {}
-            if selected_tables:
+            if selected_tables_val:  # Use selected_tables_val which has the edit default
                 st.subheader("Monitoring Configuration")
-                tab1, tab2 = st.tabs(
+                tab_row_count, tab_column_cond = st.tabs(
                     ["Row Count Thresholds", "Column Conditions"])
 
-                with tab1:
+                with tab_row_count:
                     st.info(
                         "Set min/max row count thresholds to monitor. Leave blank for no threshold.")
 
@@ -170,7 +205,7 @@ def render_table_monitor():
                     # Get existing thresholds from database for selected tables
                     existing_config = load_saved_table_config()
 
-                    for table in selected_tables:
+                    for table in selected_tables_val:
                         # Check if table already has thresholds
                         existing_min = None
                         existing_max = None
@@ -198,8 +233,11 @@ def render_table_monitor():
                                     existing_min) if existing_min is not None else 0,
                                 key=f"min_rows_{table}"
                             )
-                            if min_val > 0:  # Only save if user entered a value
+                            if min_val > 0:
                                 min_rows_dict[table] = min_val
+                            # Allow setting back to 0 (no threshold)
+                            elif table in min_rows_dict:
+                                min_rows_dict[table] = None
 
                         with col_max:
                             max_val = st.number_input(
@@ -209,73 +247,90 @@ def render_table_monitor():
                                     existing_max) if existing_max is not None else 0,
                                 key=f"max_rows_{table}"
                             )
-                            if max_val > 0:  # Only save if user entered a value
+                            if max_val > 0:
                                 max_rows_dict[table] = max_val
+                            # Allow setting back to 0 (no threshold)
+                            elif table in max_rows_dict:
+                                max_rows_dict[table] = None
 
-                with tab2:
+                with tab_column_cond:
                     st.info(
                         "Configure conditions for specific columns to monitor (optional)")
-                    for table in selected_tables:
+                    for table in selected_tables_val:
                         st.markdown(f"**{table}**")
                         columns = get_table_columns(selected_db, table)
 
                         if columns:
                             # Add a checkbox to enable/disable column monitoring for this table
+                            # Default value for enable_column_monitoring checkbox
+                            default_enable_column_monitoring = False
+                            existing_column_config_for_table = load_column_config(
+                                selected_db, table)
+                            if not existing_column_config_for_table.empty:
+                                default_enable_column_monitoring = True
+
                             enable_column_monitoring = st.checkbox(
                                 "Enable Column Monitoring",
-                                value=False,  # Default to disabled
+                                value=default_enable_column_monitoring,
                                 key=f"enable_columns_{table}"
                             )
 
                             if enable_column_monitoring:
-                                existing_config = load_column_config(
-                                    selected_db, table)
-                                selected_columns = st.multiselect(
+                                # existing_config = load_column_config(selected_db, table) # already loaded
+                                selected_columns_for_conditions = st.multiselect(
                                     "Select columns to monitor",
                                     options=[col["name"] for col in columns],
-                                    default=[cfg["column_name"] for _, cfg in existing_config.iterrows(
-                                    )] if not existing_config.empty else None,
+                                    default=[cfg["column_name"] for _, cfg in existing_column_config_for_table.iterrows(
+                                    )] if not existing_column_config_for_table.empty else None,
                                     key=f"columns_{table}"
                                 )
 
                                 column_configs = []
-                                for col in selected_columns:
+                                for col_name_to_configure in selected_columns_for_conditions:
                                     col_type = next(
-                                        (c["type"] for c in columns if c["name"] == col), None)
-                                    st.markdown(f"***{col}*** ({col_type})")
+                                        (c["type"] for c in columns if c["name"] == col_name_to_configure), None)
+                                    st.markdown(
+                                        f"***{col_name_to_configure}*** ({col_type})")
 
-                                    # Find existing configuration for this column
-                                    existing_col_config = existing_config[
-                                        existing_config["column_name"] == col
-                                    ].iloc[0] if not existing_config.empty and col in existing_config["column_name"].values else None
+                                    existing_col_config_series = None
+                                    if not existing_column_config_for_table.empty and col_name_to_configure in existing_column_config_for_table["column_name"].values:
+                                        existing_col_config_series = existing_column_config_for_table[
+                                            existing_column_config_for_table["column_name"] == col_name_to_configure
+                                        ].iloc[0]
+
+                                    condition_options = ["equals", "not_equals", "greater_than",
+                                                         "less_than", "in", "date_equals_today",
+                                                         "date_greater_than", "date_less_than"]
+                                    default_condition_index = 0
+                                    if existing_col_config_series is not None and existing_col_config_series["condition_type"] in condition_options:
+                                        default_condition_index = condition_options.index(
+                                            existing_col_config_series["condition_type"])
 
                                     condition = st.selectbox(
                                         "Condition",
-                                        options=["equals", "not_equals", "greater_than",
-                                                 "less_than", "in", "date_equals_today",
-                                                 "date_greater_than", "date_less_than"],
-                                        index=["equals", "not_equals", "greater_than",
-                                               "less_than", "in", "date_equals_today",
-                                               "date_greater_than", "date_less_than"].index(
-                                            existing_col_config["condition_type"]) if existing_col_config is not None else 0,
-                                        key=f"condition_{table}_{col}"
+                                        options=condition_options,
+                                        index=default_condition_index,
+                                        key=f"condition_{table}_{col_name_to_configure}"
                                     )
 
-                                    # Show value input only for non-date_equals_today condition
+                                    default_value_text = ""
+                                    if existing_col_config_series is not None:
+                                        default_value_text = existing_col_config_series["condition_value"]
+
                                     if condition != "date_equals_today":
                                         value = st.text_input(
                                             "Value" +
                                             (" (comma-separated for IN)" if condition == "in" else
                                              " (YYYY-MM-DD for date conditions)" if condition.startswith("date_") else ""),
-                                            value=existing_col_config["condition_value"] if existing_col_config is not None else "",
-                                            key=f"value_{table}_{col}"
+                                            value=default_value_text,
+                                            key=f"value_{table}_{col_name_to_configure}"
                                         )
                                     else:
-                                        value = "CURRENT_DATE"  # Special value for date_equals_today
+                                        value = "CURRENT_DATE"
 
-                                    if value:  # Only add configuration if a value is provided
+                                    if value:
                                         column_configs.append({
-                                            "column_name": col,
+                                            "column_name": col_name_to_configure,
                                             "condition_type": condition,
                                             "condition_value": value
                                         })
@@ -290,25 +345,41 @@ def render_table_monitor():
                                 save_column_config(selected_db, table, [])
 
             if st.button("Save Selected Tables", key="save_tables"):
-                for table in selected_tables:
-                    # Get the enable/disable state for column monitoring
-                    enable_column_monitoring = st.session_state.get(
-                        f"enable_columns_{table}", False)
+                for table_to_save in selected_tables_val:  # Iterate over the tables actually selected in the UI
+                    # Row count thresholds
+                    min_r = min_rows_dict.get(table_to_save)
+                    max_r = max_rows_dict.get(table_to_save)
 
-                    # Only save column configs if monitoring is enabled
-                    if enable_column_monitoring:
-                        column_configs = threshold_settings.get(
-                            table, {}).get("column_configs", [])
-                        if column_configs:  # Only save column config if there are configurations
-                            save_column_config(
-                                selected_db, table, column_configs)
-                    else:
-                        # Clear any existing column configurations when monitoring is disabled
-                        save_column_config(selected_db, table, [])
+                    # Column configs
+                    enable_column_monitoring_for_save = st.session_state.get(
+                        f"enable_columns_{table_to_save}", False)  # Get current state of checkbox
 
-                save_table_config(selected_db, selected_tables,
-                                  min_rows_dict, max_rows_dict)
+                    current_column_configs_for_table = []
+                    if enable_column_monitoring_for_save:
+                        # Reconstruct column_configs for THIS table based on session_state values of widgets
+                        # This is complex because threshold_settings[table]["column_configs"] was built during render
+                        # It's safer to rebuild from st.session_state if possible, or ensure threshold_settings is accurate.
+                        # For simplicity, we'll rely on threshold_settings which should be up-to-date from the render pass.
+                        current_column_configs_for_table = threshold_settings.get(
+                            table_to_save, {}).get("column_configs", [])
+
+                    save_table_config(selected_db, [table_to_save],
+                                      {table_to_save: min_r} if min_r is not None else {},
+                                      {table_to_save: max_r} if max_r is not None else {})
+
+                    if enable_column_monitoring_for_save and current_column_configs_for_table:
+                        save_column_config(
+                            selected_db, table_to_save, current_column_configs_for_table)
+                    elif not enable_column_monitoring_for_save:  # If checkbox is off, clear existing
+                        save_column_config(selected_db, table_to_save, [])
+
                 st.success("Configuration saved.")
+                # Reset edit state after save
+                st.session_state.edit_selected_db = None
+                st.session_state.edit_selected_tables = []
+                # Should already be false, but good to be sure
+                st.session_state.edit_trigger = False
+                st.experimental_rerun()  # Rerun to reflect saved changes and clear selections if needed
 
     results = []
     with col2:
@@ -319,9 +390,13 @@ def render_table_monitor():
             # Create a container for the table list
             with st.container():
                 for idx, row in saved_tables.iterrows():
-                    col_info, col_remove = st.columns([5, 1])
+                    # Define columns for info and each action button directly
+                    # Old: main_cols = st.columns([0.7, 0.3])
+                    # New: direct columns for info and 3 buttons. Ratio [7,1,1,1] for 70% info, 10% per button.
+                    info_col, details_col, edit_col, delete_col = st.columns([
+                                                                             7, 1, 1, 1])
 
-                    with col_info:
+                    with info_col:  # INFO PART
                         table_min = row['min_rows'] if pd.notna(
                             row['min_rows']) else None
                         table_max = row['max_rows'] if pd.notna(
@@ -350,20 +425,78 @@ def render_table_monitor():
                         if table_min is not None or table_max is not None:
                             threshold_info = " - Thresholds: "
                             if table_min is not None:
-                                threshold_info += f"Min={table_min}"
+                                threshold_info += f"Min={int(table_min) if pd.notna(table_min) else 'N/A'}"
                             if table_min is not None and table_max is not None:
                                 threshold_info += ", "
                             if table_max is not None:
-                                threshold_info += f"Max={table_max}"
+                                threshold_info += f"Max={int(table_max) if pd.notna(table_max) else 'N/A'}"
 
                         st.write(
                             f"{row['db_name']}.{row['table_name']} - {status} (Rows: {count}){threshold_info} - Size: {total_mb:.2f} MB (Data: {data_mb:.2f} MB, Index: {index_mb:.2f} MB)")
 
-                    with col_remove:
-                        if st.button("🗑️", key=f"remove_table_{idx}"):
+                    # ACTIONS PART - Buttons in their own columns
+                    with details_col:
+                        if st.button("ℹ️", key=f"details_table_{idx}", help="View table details", use_container_width=True):
+                            # Toggle detail view for this specific table
+                            if st.session_state.get(f"expanded_table_detail_{idx}"):
+                                st.session_state[f"expanded_table_detail_{idx}"] = False
+                            else:
+                                st.session_state[f"expanded_table_detail_{idx}"] = True
+                    with edit_col:
+                        if st.button("✏️", key=f"edit_table_{idx}", help="Edit table monitoring configuration", use_container_width=True):
+                            st.session_state.edit_selected_db = row['db_name']
+                            st.session_state.edit_selected_tables = [
+                                row['table_name']]
+                            st.session_state.edit_trigger = True
+                            st.experimental_rerun()  # Rerun to update config panel with these selections
+                    with delete_col:
+                        if st.button("🗑️", key=f"remove_table_{idx}", help="Remove table from monitoring", use_container_width=True):
                             delete_table_config(
                                 row["db_name"], row["table_name"])
+                            # Also delete associated column configs
+                            save_column_config(
+                                row["db_name"], row["table_name"], [])
                             st.experimental_rerun()
+
+                    # After the buttons, check if details should be shown for this table
+                    if st.session_state.get(f"expanded_table_detail_{idx}", False):
+                        with st.expander(f"Details for {row['db_name']}.{row['table_name']}", expanded=True):
+                            st.markdown(f"**Database:** {row['db_name']}")
+                            st.markdown(f"**Table:** {row['table_name']}")
+                            st.markdown(f"**Current Row Count:** {count}")
+                            st.markdown(f"**Status:** {status}")
+                            min_r_display = row['min_rows'] if pd.notna(
+                                row['min_rows']) else "N/A"
+                            max_r_display = row['max_rows'] if pd.notna(
+                                row['max_rows']) else "N/A"
+                            st.markdown(
+                                f"**Min Rows Threshold:** {min_r_display}")
+                            st.markdown(
+                                f"**Max Rows Threshold:** {max_r_display}")
+                            st.markdown(f"**Data Size:** {data_mb:.2f} MB")
+                            st.markdown(f"**Index Size:** {index_mb:.2f} MB")
+                            st.markdown(f"**Total Size:** {total_mb:.2f} MB")
+                            last_check_time = next((item['Last Check'] for item in results if item['Database']
+                                                   == row['db_name'] and item['Table'] == row['table_name']), "N/A")
+                            st.markdown(f"**Last Checked:** {last_check_time}")
+
+                            st.markdown("**Column Conditions:**")
+                            table_column_configs = load_column_config(
+                                row['db_name'], row['table_name'])
+                            if not table_column_configs.empty:
+                                for _, col_cfg in table_column_configs.iterrows():
+                                    val_display = col_cfg['condition_value']
+                                    if col_cfg['condition_type'] == "date_equals_today":
+                                        val_display = "(Current Date)"
+                                    st.markdown(
+                                        f"- `{col_cfg['column_name']}` {col_cfg['condition_type']} `{val_display}`")
+                            else:
+                                st.info(
+                                    "No column conditions configured for this table.")
+                            # Add a way to close the expander by clicking the details button again or a close button
+                            if st.button("Close Details", key=f"close_details_table_{idx}"):
+                                st.session_state[f"expanded_table_detail_{idx}"] = False
+                                st.experimental_rerun()
 
                     results.append({
                         'Database': row["db_name"],
@@ -451,15 +584,21 @@ def render_job_monitor():
         with col2:
             if saved_job_names:
                 st.subheader("Monitored Jobs")
-                monitored_jobs = all_jobs[all_jobs['Job Name'].isin(
-                    saved_job_names)]
+                if isinstance(all_jobs, pd.DataFrame) and 'Job Name' in all_jobs.columns:
+                    monitored_jobs_df = all_jobs[all_jobs['Job Name'].isin(
+                        saved_job_names)]
+                else:
+                    monitored_jobs_df = pd.DataFrame()
 
-                # Create a container for the job list with remove buttons
                 with st.container():
-                    for idx, (_, row) in enumerate(monitored_jobs.iterrows()):
-                        col_info, col_remove = st.columns([5, 1])
+                    for idx, (_, row) in enumerate(monitored_jobs_df.iterrows()):
+                        # Define columns for info and each action button directly
+                        # Old: main_cols = st.columns([0.7, 0.3])
+                        # New: direct columns for info and 3 buttons. Ratio [7,1,1,1].
+                        info_col, details_col, edit_col, delete_col = st.columns([
+                                                                                 7, 1, 1, 1])
 
-                        with col_info:
+                        with info_col:  # INFO PART
                             status_color = {
                                 'Running': '🔵',
                                 'Failed': '🔴',
@@ -468,19 +607,59 @@ def render_job_monitor():
                                 'Disabled': '⚪',
                                 'Canceled': '🟠',
                                 'Retry': '🟡'
-                            }.get(row['Status'], '⚪')
+                            }.get(row.get('Status', 'N/A'), '⚪')
+                            job_name_display = row.get(
+                                'Job Name', 'Unknown Job')
+                            job_status_display = row.get('Status', 'N/A')
                             st.write(
-                                f"{status_color} {row['Job Name']} ({row['Status']})")
+                                f"{status_color} {job_name_display} ({job_status_display})")
 
-                        with col_remove:
-                            # Using index in the key to ensure uniqueness
-                            if st.button("🗑️", key=f"remove_job_{idx}"):
-                                delete_job_config(row['Job Name'])
+                        # ACTIONS PART - Buttons in their own columns
+                        with details_col:
+                            if st.button("ℹ️", key=f"details_job_{idx}", help="View job details", use_container_width=True):
+                                # Toggle detail view for this specific job
+                                # Consistent key generation: using job_name_display and idx for uniqueness
+                                job_display_name_for_key = row.get(
+                                    'Job Name', 'Unknown Job')
+                                unique_job_session_key = f"expanded_job_detail_{job_display_name_for_key}_{idx}"
+
+                                if st.session_state.get(unique_job_session_key):
+                                    st.session_state[unique_job_session_key] = False
+                                else:
+                                    st.session_state[unique_job_session_key] = True
+
+                        with edit_col:
+                            if st.button("✏️", key=f"edit_job_{idx}", help="Edit job monitoring configuration", use_container_width=True):
+                                st.info(
+                                    f"Edit for job {job_name_display} is not currently applicable/implemented.")
+                        with delete_col:
+                            if st.button("🗑️", key=f"remove_job_{idx}", help="Remove job from monitoring", use_container_width=True):
+                                delete_job_config(job_name_display)
                                 st.experimental_rerun()
 
+                # After the buttons, check if details should be shown for this job
+                # Corrected line for syntax and consistent key logic:
+                job_display_name_for_expander = row.get(
+                    'Job Name', 'Unknown Job')  # Get the display name
+                # Create the consistent session key
+                current_job_session_key_for_expander = f"expanded_job_detail_{job_display_name_for_expander}_{idx}"
+
+                if st.session_state.get(current_job_session_key_for_expander, False):
+                    with st.expander(f"Details for Job: {job_display_name_for_expander}", expanded=True):
+                        # render_job_details uses the actual job name or None
+                        render_job_details(row.get('Job Name'))
+                        if st.button("Close Details", key=f"close_details_job_{idx}"):
+                            st.session_state[current_job_session_key_for_expander] = False
+                            st.experimental_rerun()
+
                 st.markdown("### Detailed Status")
-                st.dataframe(apply_status_colors(monitored_jobs,
-                             'Status'), use_container_width=True)
+                if not monitored_jobs_df.empty:
+                    st.dataframe(apply_status_colors(monitored_jobs_df,
+                                 'Status'), use_container_width=True)
+                else:
+                    st.info("No job data to display for monitored jobs.")
+            else:
+                st.info("No jobs currently selected for monitoring.")
 
     with tab2:
         st.subheader("Currently Running Jobs")
@@ -930,6 +1109,18 @@ def init_session_state():
         st.session_state.auto_refresh = False
     if 'last_auto_refresh' not in st.session_state:
         st.session_state.last_auto_refresh = time.time()
+    # For table editing
+    if 'edit_selected_db' not in st.session_state:
+        st.session_state.edit_selected_db = None
+    if 'edit_selected_tables' not in st.session_state:
+        st.session_state.edit_selected_tables = []
+    if 'edit_trigger' not in st.session_state:
+        st.session_state.edit_trigger = False
+    # For managing expanded details sections (optional, expanders manage their own state by key)
+    # if 'expanded_table_detail_key' not in st.session_state:
+    #     st.session_state.expanded_table_detail_key = None
+    # if 'expanded_job_detail_key' not in st.session_state:
+    #     st.session_state.expanded_job_detail_key = None
 
 
 def render_ui():
