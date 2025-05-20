@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
 import time
+import os  # Added import
 from datetime import datetime, timedelta
 from components.sql import (
-    get_databases, get_tables, check_selected_tables, get_job_history,
-    get_active_jobs, get_all_jobs, get_windows_user, get_job_details, get_job_steps,
-    # Added check_column_conditions
-    get_table_size_info, get_table_columns, check_column_conditions
+    get_databases, get_tables, check_selected_tables, get_table_size_info,
+    get_job_history, get_job_details, get_job_steps, get_all_jobs, get_active_jobs, get_table_columns,
+    get_rows_for_processed_today  # Added new import
 )
 from components.db import (
     save_table_config, load_saved_table_config, log_table_check_result, get_latest_log,
@@ -15,6 +15,18 @@ from components.db import (
     delete_job_config, log_alert, get_alerts, save_column_config, load_column_config
 )
 from streamlit_autorefresh import st_autorefresh
+
+
+def get_windows_user():
+    try:
+        return os.getlogin()
+    except OSError:
+        # Fallback if os.getlogin() fails (e.g., not run from a real terminal)
+        import getpass
+        try:
+            return getpass.getuser()
+        except Exception:
+            return "Unknown User"
 
 
 def apply_status_colors(df, status_column):
@@ -260,6 +272,34 @@ def render_table_monitor():
                         st.markdown(f"**{table}**")
                         columns = get_table_columns(selected_db, table)
 
+                        # Input for minimum match count for column conditions
+                        # Load existing config to get the current min_match_count for this table
+                        current_table_monitor_config_df = load_saved_table_config()
+                        current_min_match_val = 1  # Default
+                        if not current_table_monitor_config_df.empty:
+                            specific_table_config = current_table_monitor_config_df[
+                                (current_table_monitor_config_df['db_name'] == selected_db) &
+                                (current_table_monitor_config_df['table_name'] == table)
+                            ]
+                            if not specific_table_config.empty and 'column_min_match_count' in specific_table_config.columns:
+                                val_from_db = specific_table_config['column_min_match_count'].iloc[0]
+                                if pd.notna(val_from_db):
+                                    current_min_match_val = int(val_from_db)
+
+                        min_match_count_for_cols = st.number_input(
+                            "Minimum rows to meet all column conditions (0 or blank for 'all rows')",
+                            min_value=0,
+                            value=current_min_match_val,
+                            # Ensure key is unique
+                            key=f"min_match_count_cols_{selected_db}_{table}",
+                            help="For conditions to pass, at least this many rows must satisfy ALL defined column conditions. If 0 or blank, ALL rows in the table must satisfy them. For UploadLogs, this is typically 1 (existence check)."
+                        )
+                        # Store this value in session state or pass it directly to save logic
+                        if table not in threshold_settings:
+                            threshold_settings[table] = {}
+                        # Store the direct value
+                        threshold_settings[table]["column_min_match_count"] = min_match_count_for_cols
+
                         if columns:
                             # Add a checkbox to enable/disable column monitoring for this table
                             # Default value for enable_column_monitoring checkbox
@@ -350,6 +390,13 @@ def render_table_monitor():
                     min_r = min_rows_dict.get(table_to_save)
                     max_r = max_rows_dict.get(table_to_save)
 
+                    # Column min match count
+                    # Retrieve from the number_input's current value via session_state
+                    col_min_match_c = st.session_state.get(
+                        f"min_match_count_cols_{selected_db}_{table_to_save}", 1)
+                    if col_min_match_c is None:  # Ensure it has a default if somehow not set
+                        col_min_match_c = 1  # Default to 1 if not found
+
                     # Column configs
                     enable_column_monitoring_for_save = st.session_state.get(
                         f"enable_columns_{table_to_save}", False)  # Get current state of checkbox
@@ -365,7 +412,10 @@ def render_table_monitor():
 
                     save_table_config(selected_db, [table_to_save],
                                       {table_to_save: min_r} if min_r is not None else {},
-                                      {table_to_save: max_r} if max_r is not None else {})
+                                      {table_to_save: max_r} if max_r is not None else {},
+                                      # Pass the new dict here
+                                      {table_to_save: col_min_match_c}
+                                      )
 
                     if enable_column_monitoring_for_save and current_column_configs_for_table:
                         save_column_config(
@@ -391,8 +441,6 @@ def render_table_monitor():
             with st.container():
                 for idx, row in saved_tables.iterrows():
                     # Define columns for info and each action button directly
-                    # Old: main_cols = st.columns([0.7, 0.3])
-                    # New: direct columns for info and 3 buttons. Ratio [7,1,1,1] for 70% info, 10% per button.
                     info_col, details_col, edit_col, delete_col = st.columns([
                                                                              7, 1, 1, 1])
 
@@ -401,13 +449,19 @@ def render_table_monitor():
                             row['min_rows']) else None
                         table_max = row['max_rows'] if pd.notna(
                             row['max_rows']) else None
+                        table_col_min_match = row['column_min_match_count'] if pd.notna(
+                            row['column_min_match_count']) else 1  # Default to 1 if not set
+
                         table_min_dict = {
                             row['table_name']: table_min} if table_min is not None else {}
                         table_max_dict = {
                             row['table_name']: table_max} if table_max is not None else {}
+                        table_col_min_match_dict = {
+                            row['table_name']: table_col_min_match
+                        }
 
                         check_result_df = check_selected_tables(
-                            row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
+                            row["db_name"], [row["table_name"]], table_min_dict, table_max_dict, table_col_min_match_dict)
                         count = 0
                         status = "Error"
                         if not check_result_df.empty:
@@ -473,6 +527,8 @@ def render_table_monitor():
                                 f"**Min Rows Threshold:** {min_r_display}")
                             st.markdown(
                                 f"**Max Rows Threshold:** {max_r_display}")
+                            st.markdown(
+                                f"**Column Min Match Count:** {row['column_min_match_count'] if pd.notna(row['column_min_match_count']) else '1 (Default)'}")
                             st.markdown(f"**Data Size:** {data_mb:.2f} MB")
                             st.markdown(f"**Index Size:** {index_mb:.2f} MB")
                             st.markdown(f"**Total Size:** {total_mb:.2f} MB")
@@ -530,6 +586,43 @@ def render_table_monitor():
         else:
             st.info(
                 "No tables selected for monitoring. Please configure tables above.")
+
+    # New section for viewing rows processed today
+    st.divider()
+    st.subheader("View Processed Rows for Today")
+    selected_db_for_view = st.selectbox(
+        "Select Database for Viewing Processed Rows", get_databases(), key="db_processed_view")
+    if selected_db_for_view:
+        tables_in_db_for_view = get_tables(selected_db_for_view)
+        selected_table_for_view = st.selectbox(
+            "Select Table for Viewing Processed Rows", tables_in_db_for_view, key="table_processed_view")
+        if selected_table_for_view:
+            # Try to guess common date columns or let user input
+            # For now, let's assume a common date column name, e.g., 'MoveDate'
+            # This should ideally be selectable or configurable
+            date_column_name_view = st.text_input(
+                "Enter the date column name (e.g., MoveDate, created_at)", value="MoveDate", key="date_col_processed_view")
+            processed_column_name_view = st.text_input(
+                "Enter the 'processed' status column name", value="Processed", key="proc_col_processed_view")
+
+            if st.button("Show Processed Rows for Today", key="show_processed_rows_button"):
+                if not date_column_name_view:
+                    st.warning("Please enter a date column name.")
+                elif not processed_column_name_view:
+                    st.warning("Please enter the processed column name.")
+                else:
+                    with st.spinner(f"Fetching rows from {selected_table_for_view} where {date_column_name_view} is today and {processed_column_name_view} = 1..."):
+                        processed_rows_df = get_rows_for_processed_today(
+                            selected_db_for_view,
+                            selected_table_for_view,
+                            date_column_name_view,
+                            processed_column_name_view
+                        )
+                        if not processed_rows_df.empty:
+                            st.dataframe(processed_rows_df)
+                        else:
+                            st.info(
+                                "No rows found matching the criteria, or an error occurred.")
 
     return results
 
@@ -980,19 +1073,41 @@ def render_dashboard_view():
     with col2:
         st.markdown("### ⚠️ Table Issues")
         if not table_stats.empty:
-            # Only show tables that have actual issues (Empty tables or failed column conditions)
+            # Only show tables that have actual issues (including column condition failures)
             problem_tables = table_stats[
                 (table_stats['Status'] == 'Empty') |
-                # For failed column conditions
-                (table_stats['Status'].str.contains('not met')) |
-                (table_stats['Status'] == 'Warn-LowCount') |
-                (table_stats['Status'] == 'Warn-HighCount')
+                # Catch all warning statuses
+                (table_stats['Status'].str.contains('Warn-')) |
+                # Catch condition not met
+                (table_stats['Status'].str.contains('not met', case=False)) |
+                (table_stats['Status'].str.contains(
+                    'Error'))  # Catch all errors
             ]
             if not problem_tables.empty:
                 for _, table in problem_tables.iterrows():
-                    st.warning(
-                        f"{table['Database']}.{table['Table']} - {table['Status']}"
-                    )
+                    warning_message = f"{table['Database']}.{table['Table']} - {table['Status']}"
+
+                    # Add extra context for unprocessed records
+                    if "UnprocessedRecords" in table['Status']:
+                        conn = get_connection(table['Database'])
+                        cursor = conn.cursor()
+                        try:
+                            query = """
+                            SELECT COUNT(*) 
+                            FROM [{0}].[dbo].[{1}] 
+                            WHERE CAST(MoveDate AS DATE) = CAST(GETDATE() AS DATE)
+                            AND Processed = 0
+                            """.format(table['Database'], table['Table'])
+                            cursor.execute(query)
+                            unprocessed_count = cursor.fetchone()[0]
+                            warning_message += f" ({unprocessed_count} unprocessed records)"
+                        finally:
+                            if cursor:
+                                cursor.close()
+                            if conn:
+                                conn.close()
+
+                    st.warning(warning_message)
             else:
                 st.success("No table issues detected")
         else:
@@ -1185,14 +1300,19 @@ def get_latest_table_results():
                     row['min_rows']) else None
                 table_max = row['max_rows'] if pd.notna(
                     row['max_rows']) else None
+                table_col_min_match = row['column_min_match_count'] if pd.notna(
+                    row['column_min_match_count']) else 1
+
                 table_min_dict = {
                     row['table_name']: table_min} if table_min is not None else {}
                 table_max_dict = {
                     row['table_name']: table_max} if table_max is not None else {}
+                table_col_min_match_dict = {
+                    row['table_name']: table_col_min_match}
 
                 # Get table status
                 check_result_df = check_selected_tables(
-                    row["db_name"], [row["table_name"]], table_min_dict, table_max_dict)
+                    row["db_name"], [row["table_name"]], table_min_dict, table_max_dict, table_col_min_match_dict)
 
                 count = 0
                 status = "Error"
@@ -1201,7 +1321,7 @@ def get_latest_table_results():
                         check_result_df.iloc[0]["Rows"]) if check_result_df.iloc[0]["Rows"].isdigit() else 0
                     status = check_result_df.iloc[0]["Status"]
 
-                # Get size info in a separate operation
+                # Get size info
                 size_info = get_table_size_info(
                     row["db_name"], row["table_name"])
                 data_mb = size_info['data_kb'] / 1024
@@ -1229,8 +1349,53 @@ def get_latest_table_results():
                     status
                 )
 
-                # Log alerts for table issues if needed
-                if status != "OK":
+                # Special handling for MoveFrames unprocessed records
+                if row["table_name"] == "MoveFrames":
+                    table_column_configs = load_column_config(
+                        row["db_name"], row["table_name"])
+                    if not table_column_configs.empty:
+                        # Check if we're monitoring Processed=0
+                        processed_config = table_column_configs[
+                            (table_column_configs["column_name"] == "Processed") &
+                            (table_column_configs["condition_value"] == "0")
+                        ]
+                        if not processed_config.empty:
+                            conn = get_connection(row["db_name"])
+                            cursor = conn.cursor()
+                            try:
+                                # Count unprocessed records for today
+                                query = """
+                                SELECT COUNT(*) 
+                                FROM [{0}].[dbo].[MoveFrames] 
+                                WHERE CAST(MoveDate AS DATE) = CAST(GETDATE() AS DATE)
+                                AND Processed = 0
+                                """.format(row["db_name"])
+                                cursor.execute(query)
+                                unprocessed_count = cursor.fetchone()[0]
+
+                                if unprocessed_count > 0:
+                                    status = "Warn-UnprocessedRecords"
+                                    details = f"Database: {row['db_name']}\n"
+                                    details += f"Table: {row['table_name']}\n"
+                                    details += f"Unprocessed Records: {unprocessed_count}\n"
+                                    details += f"Date: {datetime.now().strftime('%Y-%m-%d')}\n"
+
+                                    log_alert(
+                                        alert_type="Table",
+                                        source_type="Unprocessed Records",
+                                        source_name=f"{row['db_name']}.{row['table_name']}",
+                                        status=status,
+                                        message=f"Found {unprocessed_count} unprocessed records in {row['table_name']} for today",
+                                        details=details
+                                    )
+                            finally:
+                                if cursor:
+                                    cursor.close()
+                                if conn:
+                                    conn.close()
+
+                # Log alerts for other table issues
+                elif status != "OK":
                     source_type = ""
                     if status == "Empty":
                         source_type = "Empty Table"

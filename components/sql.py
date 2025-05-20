@@ -84,12 +84,12 @@ def get_databases():
             try:
                 cursor.close()
             except pyodbc.Error:
-                pass  # Optionally log error
+                pass
         if conn:
             try:
                 conn.close()
             except pyodbc.Error:
-                pass  # Optionally log error
+                pass
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
@@ -762,8 +762,6 @@ def check_column_conditions(db, table, column_configs, min_match_count=1):
     """
     Check if table data meets the column conditions.
     Returns: dict with column names as keys and boolean results (met/not met) as values.
-             For UploadLogs, a combined condition (e.g. status & date) will update results for both involved columns.
-             For other tables, it checks if at least min_match_count rows satisfy ALL combined conditions.
     """
     if not column_configs:
         return {}
@@ -777,182 +775,151 @@ def check_column_conditions(db, table, column_configs, min_match_count=1):
         conn = get_connection(db)
         cursor = conn.cursor()
 
-        # Special handling for UploadLogs table (checks for existence of ANY matching row)
-        if table == "UploadLogs":
-            # First check if we have both status and date conditions
-            has_status = any(cfg["column_name"] ==
-                             "status" for cfg in column_configs)
-            has_date = any(cfg["column_name"].startswith("created_")
-                           for cfg in column_configs)
+        # Special handling for MoveFrames table to check for unprocessed records
+        if table == "MoveFrames":
+            # First check if we have both Processed and MoveDate conditions
+            processed_config = next(
+                (cfg for cfg in column_configs if cfg["column_name"] == "Processed"), None)
+            date_config = next(
+                (cfg for cfg in column_configs if cfg["column_name"] == "MoveDate"), None)
 
-            if has_status and has_date:
-                # Get the configurations
-                status_config = next(
-                    cfg for cfg in column_configs if cfg["column_name"] == "status")
-                date_config = next(
-                    cfg for cfg in column_configs if cfg["column_name"].startswith("created_"))
+            if processed_config and date_config:
+                # Build query to check for records matching the conditions
+                query = """
+                SELECT COUNT(*) 
+                FROM [{0}].[dbo].[MoveFrames] 
+                WHERE CAST(MoveDate AS DATE) = CAST(GETDATE() AS DATE)
+                AND Processed = ?
+                """.format(db)
 
-                # Build the combined query
-                where_clauses = []
-                all_params = []
+                cursor.execute(query, [processed_config["condition_value"]])
+                matching_count = cursor.fetchone()[0]
 
-                # Add status condition
-                if status_config["condition_type"] == "in":
-                    status_values = [
-                        v.strip() for v in status_config["condition_value"].split(",")]
-                    status_placeholders = ",".join("?" * len(status_values))
-                    where_clauses.append(f"status IN ({status_placeholders})")
-                    all_params.extend(status_values)
-                else:
-                    where_clauses.append("status = ?")
-                    all_params.append(status_config["condition_value"])
+                # For MoveFrames, finding records with Processed = 0 means the condition is NOT met
+                # So if we're checking for Processed = 0 and we find records, that's a failure state
+                condition_met = (matching_count == 0 if processed_config["condition_value"] == "0"
+                                 else matching_count > 0)
 
-                # Add date condition
-                if date_config["condition_type"] == "date_equals_today":
-                    where_clauses.append(
-                        "CAST(created_at AS DATE) = CAST(GETDATE() AS DATE)")
-                elif date_config["condition_type"] == "date_greater_than":
-                    where_clauses.append(
-                        "CAST(created_at AS DATE) > CAST(? AS DATE)")
-                    all_params.append(date_config["condition_value"])
-                elif date_config["condition_type"] == "date_less_than":
-                    where_clauses.append(
-                        "CAST(created_at AS DATE) < CAST(? AS DATE)")
-                    all_params.append(date_config["condition_value"])
+                # Update results for both columns
+                results[processed_config["column_name"]] = condition_met
+                results[date_config["column_name"]] = condition_met
 
-                # Execute combined query
-                conn = get_connection(db)
-                cursor = conn.cursor()
-                try:
-                    combined_where = " AND ".join(where_clauses)
-                    query = f"SELECT COUNT(*) FROM [{table}] WHERE {combined_where}"
-                    cursor.execute(query, all_params)
-                    count = cursor.fetchone()[0]
-                    # Update results for both columns
-                    combined_result = count > 0
-                    results["status"] = combined_result
-                    results[date_config["column_name"]] = combined_result
-                except Exception as e:
-                    print(f"Error checking combined conditions: {str(e)}")
-                    results["status"] = False
-                    results[date_config["column_name"]] = False
-                finally:
-                    cursor.close()
-                    conn.close()
+                return results
+
+        # Standard handling for other tables
+        where_clauses = []
+        all_params = []
+
+        for config in column_configs:
+            column = config["column_name"]
+            cond_type = config["condition_type"]
+            value = config["condition_value"]
+
+            if cond_type == "equals":
+                where_clauses.append(f"{column} = ?")
+                all_params.append(value)
+            elif cond_type == "not_equals":
+                where_clauses.append(f"{column} <> ?")
+                all_params.append(value)
+            elif cond_type == "in":
+                values = [v.strip() for v in value.split(",")]
+                placeholders = ",".join("?" * len(values))
+                where_clauses.append(f"{column} IN ({placeholders})")
+                all_params.extend(values)
+            elif cond_type == "date_equals_today":
+                where_clauses.append(
+                    f"CAST({column} AS DATE) = CAST(GETDATE() AS DATE)")
+            elif cond_type == "date_greater_than":
+                where_clauses.append(
+                    f"CAST({column} AS DATE) > CAST(? AS DATE)")
+                all_params.append(value)
+            elif cond_type == "date_less_than":
+                where_clauses.append(
+                    f"CAST({column} AS DATE) < CAST(? AS DATE)")
+                all_params.append(value)
+
+        if where_clauses:
+            combined_where = " AND ".join(where_clauses)
+            query = f"SELECT COUNT(*) FROM [{table}] WHERE {combined_where}"
+
+            if all_params:
+                cursor.execute(query, all_params)
             else:
-                # Handle individual conditions
-                for config in column_configs:
-                    conn = get_connection(db)
-                    cursor = conn.cursor()
-                    try:
-                        column = config["column_name"]
-                        cond_type = config["condition_type"]
-                        value = config["condition_value"]
+                cursor.execute(query)
 
-                        where_clause = ""
-                        params = []
+            count = cursor.fetchone()[0]
 
-                        if cond_type == "equals":
-                            where_clause = f"{column} = ?"
-                            params = [value]
-                        elif cond_type == "not_equals":
-                            where_clause = f"{column} <> ?"
-                            params = [value]
-                        elif cond_type == "in":
-                            values = [v.strip() for v in value.split(",")]
-                            placeholders = ",".join("?" * len(values))
-                            where_clause = f"{column} IN ({placeholders})"
-                            params = values
-                        elif cond_type == "date_equals_today":
-                            where_clause = f"CAST({column} AS DATE) = CAST(GETDATE() AS DATE)"
-                            params = []
-                        elif cond_type == "date_greater_than":
-                            where_clause = f"CAST({column} AS DATE) > CAST(? AS DATE)"
-                            params = [value]
-                        elif cond_type == "date_less_than":
-                            where_clause = f"CAST({column} AS DATE) < CAST(? AS DATE)"
-                            params = [value]
+            total_query = f"SELECT COUNT(*) FROM [{table}]"
+            cursor.execute(total_query)
+            total = cursor.fetchone()[0]
 
-                        query = f"SELECT COUNT(*) FROM [{table}] WHERE {where_clause}"
-                        cursor.execute(query, params)
-                        count = cursor.fetchone()[0]
-                        results[column] = count > 0
+            # Determine if conditions are met based on min_match_count
+            if min_match_count == 0:
+                # If 0, all rows in the table must match the conditions
+                # An empty table (total=0) cannot satisfy this
+                condition_met = (count == total and total > 0)
+            else:
+                # If > 0, at least 'min_match_count' rows must match
+                condition_met = (count >= min_match_count)
 
-                    except Exception as e:
-                        print(
-                            f"Error checking condition for {config['column_name']}: {str(e)}")
-                        results[config["column_name"]] = False
-                    finally:
-                        cursor.close()
-                        conn.close()
-        else:
-            # Standard handling for other tables
-            conn = get_connection(db)
-            cursor = conn.cursor()
-            try:
-                where_clauses = []
-                all_params = []
-
-                for config in column_configs:
-                    column = config["column_name"]
-                    cond_type = config["condition_type"]
-                    value = config["condition_value"]
-
-                    if cond_type == "equals":
-                        where_clauses.append(f"{column} = ?")
-                        all_params.append(value)
-                    elif cond_type == "not_equals":
-                        where_clauses.append(f"{column} <> ?")
-                        all_params.append(value)
-                    elif cond_type == "in":
-                        values = [v.strip() for v in value.split(",")]
-                        placeholders = ",".join("?" * len(values))
-                        where_clauses.append(f"{column} IN ({placeholders})")
-                        all_params.extend(values)
-                    elif cond_type == "date_equals_today":
-                        where_clauses.append(
-                            f"CAST({column} AS DATE) = CAST(GETDATE() AS DATE)")
-                    elif cond_type == "date_greater_than":
-                        where_clauses.append(
-                            f"CAST({column} AS DATE) > CAST(? AS DATE)")
-                        all_params.append(value)
-                    elif cond_type == "date_less_than":
-                        where_clauses.append(
-                            f"CAST({column} AS DATE) < CAST(? AS DATE)")
-                        all_params.append(value)
-
-                if where_clauses:
-                    combined_where = " AND ".join(where_clauses)
-                    query = f"SELECT COUNT(*) FROM [{table}] WHERE {combined_where}"
-
-                    if all_params:
-                        cursor.execute(query, all_params)
-                    else:
-                        cursor.execute(query)
-
-                    count = cursor.fetchone()[0]
-                    cursor.close()
-
-                    total_query = f"SELECT COUNT(*) FROM [{table}]"
-                    cursor = conn.cursor()
-                    cursor.execute(total_query)
-                    total = cursor.fetchone()[0]
-
-                    # For other tables, condition is met if all rows satisfy it
-                    condition_met = count == total
-                    for config in column_configs:
-                        results[config["column_name"]] = condition_met
-            except Exception as e:
-                print(f"Error checking conditions for {table}: {str(e)}")
-                for config in column_configs:
-                    results[config["column_name"]] = False
-            finally:
-                cursor.close()
-                conn.close()
+            for config_item in column_configs:
+                results[config_item["column_name"]] = condition_met
 
     except Exception as e:
-        print(f"Error in check_column_conditions: {str(e)}")
+        print(f"Error in check_column_conditions for {table}: {str(e)}")
         for config in column_configs:
             results[config["column_name"]] = False
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
 
     return results
+
+
+def get_rows_for_processed_today(db, table_name, date_column_name, processed_column_name="Processed"):
+    """
+    Fetches all rows from a table where the date_column matches today's date
+    and the processed_column is 1.
+    """
+    conn = None
+    # cursor = None # Not needed as pd.read_sql handles cursor management
+    try:
+        conn = get_connection(db)
+        # Basic validation for column/table names to ensure they are somewhat reasonable
+        # This is not a full SQL injection proofing but a basic check.
+        # Assumes names are simple identifiers, possibly with underscores.
+        # SQL Server specific quoting with [] handles spaces or keywords if names are passed correctly.
+        if not all(name.replace('_', '').replace('[', '').replace(']', '').isalnum() for name in [table_name, date_column_name, processed_column_name]):
+            st.error(
+                f"Invalid table or column name format provided: {table_name}, {date_column_name}, {processed_column_name}")
+            return pd.DataFrame([])
+
+        query = f"""
+            SELECT *
+            FROM [{table_name}]
+            WHERE CAST([{date_column_name}] AS DATE) = CAST(GETDATE() AS DATE)
+              AND [{processed_column_name}] = 1
+        """
+        df = pd.read_sql(query, conn)
+        return df
+    except pyodbc.Error as e:
+        st.error(f"SQL Error fetching rows for {db}.{table_name}: {str(e)}")
+        return pd.DataFrame([])
+    except Exception as e:
+        st.error(f"An unexpected error occurred while fetching rows: {str(e)}")
+        return pd.DataFrame([])
+    finally:
+        # pd.read_sql usually handles connection closing, but explicit close is safer
+        if conn:
+            try:
+                conn.close()
+            except pyodbc.Error:
+                pass
