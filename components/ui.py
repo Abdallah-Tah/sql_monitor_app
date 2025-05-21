@@ -987,12 +987,41 @@ def render_dashboard_view():
 
     table_stats = pd.DataFrame(
         table_results_for_stats) if table_results_for_stats else pd.DataFrame()
-    empty_tables = len(
-        table_stats[table_stats['Status'] == 'Empty']) if not table_stats.empty else 0
-    error_tables = len(table_stats[table_stats['Status'].str.startswith(
-        'Error')]) if not table_stats.empty else 0
-    healthy_tables = len(
-        table_stats[table_stats['Status'] == 'OK']) if not table_stats.empty else 0
+
+    # Define status categories
+    ok_statuses = ['OK', 'OK-ColumnConditionMet']
+    # Keywords to identify warning/empty statuses
+    warning_keywords = ['Warn', 'Empty']
+
+    healthy_tables_count = 0
+    warning_tables_count = 0
+    error_tables_count = 0
+
+    if not table_stats.empty:
+        healthy_tables_count = len(
+            table_stats[table_stats['Status'].isin(ok_statuses)])
+
+        # Count warning tables: contains a warning keyword, is not an error, and is not healthy
+        warning_tables_count = len(table_stats[
+            table_stats['Status'].apply(lambda x: isinstance(x, str) and any(keyword in x for keyword in warning_keywords)) &
+            ~table_stats['Status'].str.startswith('Error', na=False) &
+            ~table_stats['Status'].isin(ok_statuses)
+        ])
+        # Ensure 'Empty' tables that are not also 'Error' or 'OK' are counted as warnings if not already.
+        # The above logic should catch 'Empty' if it's not an error or OK.
+        # If an 'Empty' table could also be 'OK' or 'Error' by some logic, this might need refinement.
+        # For now, assuming 'Empty' is a type of warning if not an error.
+
+        error_tables_count = len(
+            table_stats[table_stats['Status'].str.startswith('Error', na=False)])
+
+        # Adjust healthy_tables_count if a table is counted in multiple categories (e.g. an empty table that is not an error or warning otherwise)
+        # The current logic tries to make categories exclusive.
+        # Total monitored tables
+        total_monitored_tables = len(table_stats)
+        # Sanity check: healthy + warning + error should ideally be <= total_monitored_tables
+        # If a table is e.g. 'Empty' and also 'Warn-ColumnConditionNotMet', it's one warning.
+        # The current warning_tables_count logic should handle this by checking for keywords.
 
     # Dashboard Layout
     st.markdown("## 📊 System Overview")
@@ -1015,14 +1044,14 @@ def render_dashboard_view():
     st.markdown("---")
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("✅ Healthy Tables", healthy_tables)
+        st.metric("✅ Healthy Tables", healthy_tables_count)
     with col2:
-        st.metric("⚠️ Empty Tables", empty_tables,
-                  delta=f"{empty_tables} tables" if empty_tables > 0 else None,
+        st.metric("⚠️ Warning Tables", warning_tables_count,
+                  delta=f"{warning_tables_count} tables" if warning_tables_count > 0 else None,
                   delta_color="inverse")
     with col3:
-        st.metric("❌ Error Tables", error_tables,
-                  delta=f"{error_tables} tables" if error_tables > 0 else None,
+        st.metric("❌ Error Tables", error_tables_count,
+                  delta=f"{error_tables_count} tables" if error_tables_count > 0 else None,
                   delta_color="inverse")
 
     # Active Jobs Section
@@ -1061,166 +1090,94 @@ def render_dashboard_view():
 
     # Recent Problems Section
     st.markdown("---")
-    col1, col2 = st.columns(2)
+    # Removed st.columns(2) for vertical layout
 
-    with col1:
-        st.markdown("### ❌ Recent Job Failures")
-        if not job_history.empty:
-            failed_jobs = job_history[job_history['Status'] == 'Failed'].head(
-                5)
-            if not failed_jobs.empty:
-                for _, job in failed_jobs.iterrows():
-                    st.error(
-                        f"{job['Job Name']} - {job['Run Date']} {job['Run Time']}")
-            else:
-                st.success("No recent job failures")
+    # Recent Job Failures
+    st.markdown("### ❌ Recent Job Failures")
+    if not job_history.empty:
+        failed_jobs = job_history[job_history['Status'] == 'Failed'].head(
+            5)
+        if not failed_jobs.empty:
+            for _, job in failed_jobs.iterrows():
+                st.error(
+                    f"{job['Job Name']} - {job['Run Date']} {job['Run Time']}")
         else:
-            st.info("No job history available")
+            st.success("No recent job failures")
+    else:
+        st.info("No recent job failures to display.")
 
-    with col2:
-        st.markdown("### ⚠️ Table Issues")
-        if not table_stats.empty:
-            problem_tables = table_stats[
-                (table_stats['Status'] == 'Empty') |
-                # Catch all warning statuses
-                (table_stats['Status'].str.contains('Warn-')) |
-                # Catch condition not met
-                (table_stats['Status'].str.contains('not met', case=False)) |
-                (table_stats['Status'].str.contains(
-                    'Error'))  # Catch all errors
-            ]
-            if problem_tables.empty:
-                st.success("No table issues detected")
-            else:
-                # Add filters at the top of the Table Issues section
-                filter_col1, filter_col2 = st.columns(2)
-                with filter_col1:
-                    status_filter = st.multiselect(
-                        "Filter by Status",
-                        options=['Empty', 'Warn-LowCount', 'Warn-HighCount',
-                                 'Warn-ColumnConditionNotMet', 'Error'],
-                        default=[],
-                        key="table_issues_status_filter"
-                    )
-                with filter_col2:
-                    db_filter = st.multiselect(
-                        "Filter by Database",
-                        options=problem_tables['Database'].unique(
-                        ).tolist(),  # Convert to list
-                        default=[],
-                        key="table_issues_db_filter"
-                    )
+    st.markdown("---")  # Adding a separator for clarity
 
-                # Apply filters
-                filtered_tables = problem_tables.copy()
-                if status_filter:
-                    filtered_tables = filtered_tables[filtered_tables['Status'].isin(
-                        status_filter)]
-                if db_filter:
-                    filtered_tables = filtered_tables[filtered_tables['Database'].isin(
-                        db_filter)]
+    # Table Issues
+    st.markdown("### ⚠️ Table Issues")
+    if not table_stats.empty:
+        # Filter for tables that are not 'OK' or 'OK-ColumnConditionMet'
+        issue_tables = table_stats[~table_stats['Status'].isin(ok_statuses)]
+        if not issue_tables.empty:
+            # Add filters at the top of the Table Issues section
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                status_filter = st.multiselect(
+                    "Filter by Status",
+                    options=['Empty', 'Warn-LowCount', 'Warn-HighCount',
+                             'Warn-ColumnConditionNotMet', 'Error'],
+                    default=[],
+                    key="table_issues_status_filter"
+                )
+            with filter_col2:
+                db_filter = st.multiselect(
+                    "Filter by Database",
+                    options=issue_tables['Database'].unique(
+                    ).tolist(),  # Convert to list
+                    default=[],
+                    key="table_issues_db_filter"
+                )
 
-                for _, table in filtered_tables.iterrows():
-                    warning_message = f"{table['Database']}.{table['Table']} - {table['Status']}"
+            # Apply filters
+            filtered_tables = issue_tables.copy()
+            if status_filter:
+                filtered_tables = filtered_tables[filtered_tables['Status'].isin(
+                    status_filter)]
+            if db_filter:
+                filtered_tables = filtered_tables[filtered_tables['Database'].isin(
+                    db_filter)]
 
-                    # Get affected rows based on status type
-                    if table['Table'] == "MoveFrames" and "ColumnCondition" in table['Status']:
-                        conn = get_connection(table['Database'])
-                        cursor = conn.cursor()
-                        try:
-                            # First show the count with proper date comparison
-                            query_count = """
-                            SELECT COUNT(*) 
+            for _, table in filtered_tables.iterrows():
+                warning_message = f"{table['Database']}.{table['Table']} - {table['Status']}"
+
+                # Get affected rows based on status type
+                if table['Table'] == "MoveFrames" and "ColumnCondition" in table['Status']:
+                    conn = get_connection(table['Database'])
+                    cursor = conn.cursor()
+                    try:
+                        # First show the count with proper date comparison
+                        query_count = """
+                        SELECT COUNT(*) 
+                        FROM [{0}].[dbo].[{1}] 
+                        WHERE CAST(MoveDate AS DATE) = CAST(GETDATE() AS DATE)
+                        AND Processed = 0
+                        """.format(table['Database'], table['Table'])
+                        cursor.execute(query_count)
+                        affected_count = cursor.fetchone()[0]
+                        warning_message += f" ({affected_count} unprocessed records)"
+
+                        # Then get the actual rows with correct columns
+                        if affected_count > 0:
+                            query_rows = """
+                            SELECT MoveFramesID, FrameNumber, ShopOrderNumber, MoveDate, 
+                                   CAST(MoveDate AS DATE) as MoveDateOnly, Processed
                             FROM [{0}].[dbo].[{1}] 
                             WHERE CAST(MoveDate AS DATE) = CAST(GETDATE() AS DATE)
                             AND Processed = 0
+                            ORDER BY MoveDate DESC
                             """.format(table['Database'], table['Table'])
-                            cursor.execute(query_count)
-                            affected_count = cursor.fetchone()[0]
-                            warning_message += f" ({affected_count} unprocessed records)"
+                            df = pd.read_sql(query_rows, conn)
 
-                            # Then get the actual rows with correct columns
-                            if affected_count > 0:
-                                query_rows = """
-                                SELECT MoveFramesID, FrameNumber, ShopOrderNumber, MoveDate, 
-                                       CAST(MoveDate AS DATE) as MoveDateOnly, Processed
-                                FROM [{0}].[dbo].[{1}] 
-                                WHERE CAST(MoveDate AS DATE) = CAST(GETDATE() AS DATE)
-                                AND Processed = 0
-                                ORDER BY MoveDate DESC
-                                """.format(table['Database'], table['Table'])
-                                df = pd.read_sql(query_rows, conn)
-
-                                # Add column filtering
-                                if not df.empty:
-                                    st.warning(warning_message)
-
-                                    # Add column filters
-                                    col_filters = st.expander(
-                                        "Column Filters", expanded=False)
-                                    with col_filters:
-                                        filter_cols = st.multiselect(
-                                            "Filter by columns",
-                                            options=df.columns.tolist(),  # Convert to list
-                                            default=[]
-                                        )
-
-                                        filtered_df = df.copy()
-                                        for col in filter_cols:
-                                            if col in df.columns:
-                                                # Convert unique values to list and handle non-string types
-                                                unique_vals = df[col].unique()
-                                                if not isinstance(unique_vals[0], str):
-                                                    unique_vals = [
-                                                        str(val) for val in unique_vals]
-                                                else:
-                                                    unique_vals = unique_vals.tolist()
-
-                                                selected_vals = st.multiselect(
-                                                    f"Select {col} values",
-                                                    options=unique_vals,
-                                                    default=unique_vals
-                                                )
-
-                                                # Convert selected values to appropriate type for comparison
-                                                if not isinstance(df[col].iloc[0], str):
-                                                    selected_vals = [type(df[col].iloc[0])(
-                                                        val) for val in selected_vals]
-
-                                                filtered_df = filtered_df[filtered_df[col].isin(
-                                                    selected_vals)]
-
-                                    st.dataframe(
-                                        filtered_df, use_container_width=True)
-                            else:
-                                st.warning(warning_message)
-                        finally:
-                            if cursor:
-                                cursor.close()
-                            if conn:
-                                conn.close()
-                    elif table['Status'] == "Empty":
-                        warning_message += " (0 rows)"
-                        st.warning(warning_message)
-                    elif "LowCount" in table['Status'] or "HighCount" in table['Status']:
-                        conn = get_connection(table['Database'])
-                        try:
-                            query = f"""
-                            SELECT * 
-                            FROM [{table['Database']}].[dbo].[{table['Table']}]
-                            {'TOP 1000' if 'HighCount' in table['Status'] else ''}
-                            """
-                            df = pd.read_sql(query, conn)
-
-                            if "LowCount" in table['Status']:
-                                warning_message += f" (Current: {table['Row Count']} rows, Required: {table['Min Rows']} rows)"
-                            else:
-                                warning_message += f" (Current: {table['Row Count']} rows, Maximum: {table['Max Rows']} rows)"
-
-                            st.warning(warning_message)
-
-                            # Add column filters
+                            # Add column filtering
                             if not df.empty:
+                                st.warning(warning_message)
+
+                                # Add column filters
                                 col_filters = st.expander(
                                     "Column Filters", expanded=False)
                                 with col_filters:
@@ -1255,20 +1212,83 @@ def render_dashboard_view():
                                             filtered_df = filtered_df[filtered_df[col].isin(
                                                 selected_vals)]
 
-                                st.dataframe(
-                                    filtered_df, use_container_width=True)
+                                    st.dataframe(
+                                        filtered_df, use_container_width=True)
+                    finally:
+                        if cursor:
+                            cursor.close()
+                        if conn:
+                            conn.close()
+                elif table['Status'] == "Empty":
+                    warning_message += " (0 rows)"
+                    st.warning(warning_message)
+                elif "LowCount" in table['Status'] or "HighCount" in table['Status']:
+                    conn = get_connection(table['Database'])
+                    try:
+                        query = f"""
+                        SELECT * 
+                        FROM [{table['Database']}].[dbo].[{table['Table']}]
+                        {'TOP 1000' if 'HighCount' in table['Status'] else ''}
+                        """
+                        df = pd.read_sql(query, conn)
 
-                                if "HighCount" in table['Status'] and int(table['Row Count']) > 1000:
-                                    st.info("Showing first 1000 rows only")
-                        finally:
-                            if conn:
-                                conn.close()
-                    elif "Error" in table['Status']:
-                        warning_message += f" (Error accessing table)"
-                        st.error(warning_message)
-                    else:
-                        warning_message += f" (Affected rows: {table['Row Count']})"
+                        if "LowCount" in table['Status']:
+                            warning_message += f" (Current: {table['Row Count']} rows, Required: {table['Min Rows']} rows)"
+                        else:
+                            warning_message += f" (Current: {table['Row Count']} rows, Maximum: {table['Max Rows']} rows)"
+
                         st.warning(warning_message)
+
+                        # Add column filters
+                        if not df.empty:
+                            col_filters = st.expander(
+                                "Column Filters", expanded=False)
+                            with col_filters:
+                                filter_cols = st.multiselect(
+                                    "Filter by columns",
+                                    options=df.columns.tolist(),  # Convert to list
+                                    default=[]
+                                )
+
+                                filtered_df = df.copy()
+                                for col in filter_cols:
+                                    if col in df.columns:
+                                        # Convert unique values to list and handle non-string types
+                                        unique_vals = df[col].unique()
+                                        if not isinstance(unique_vals[0], str):
+                                            unique_vals = [
+                                                str(val) for val in unique_vals]
+                                        else:
+                                            unique_vals = unique_vals.tolist()
+
+                                        selected_vals = st.multiselect(
+                                            f"Select {col} values",
+                                            options=unique_vals,
+                                            default=unique_vals
+                                        )
+
+                                        # Convert selected values to appropriate type for comparison
+                                        if not isinstance(df[col].iloc[0], str):
+                                            selected_vals = [type(df[col].iloc[0])(
+                                                val) for val in selected_vals]
+
+                                        filtered_df = filtered_df[filtered_df[col].isin(
+                                            selected_vals)]
+
+                            st.dataframe(
+                                filtered_df, use_container_width=True)
+
+                            if "HighCount" in table['Status'] and int(table['Row Count']) > 1000:
+                                st.info("Showing first 1000 rows only")
+                    finally:
+                        if conn:
+                            conn.close()
+                elif "Error" in table['Status']:
+                    warning_message += f" (Error accessing table)"
+                    st.error(warning_message)
+                else:
+                    warning_message += f" (Affected rows: {table['Row Count']})"
+                    st.warning(warning_message)
         else:
             st.info("No tables being monitored")
 
