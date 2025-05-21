@@ -61,17 +61,18 @@ def show_notifications(table_results, job_results):
     table_issues = []
 
     if table_results:
-        # Find tables with various issues
-        empty_tables = [r for r in table_results if r['Status'] == 'Empty']
-        error_tables = [
-            r for r in table_results if r['Status'].startswith('Error')]
-        low_count_tables = [
-            r for r in table_results if r['Status'] == 'Warn-LowCount']
-        high_count_tables = [
-            r for r in table_results if r['Status'] == 'Warn-HighCount']
-
-        table_issues = empty_tables + error_tables + \
-            low_count_tables + high_count_tables
+        # Find tables with various issues and include them all in table_issues
+        for table in table_results:
+            if table['Status'] == 'Empty':
+                table_issues.append(table)
+            elif table['Status'].startswith('Error'):
+                table_issues.append(table)
+            elif table['Status'] == 'Warn-LowCount':
+                table_issues.append(table)
+            elif table['Status'] == 'Warn-HighCount':
+                table_issues.append(table)
+            elif 'ColumnConditionNotMet' in table['Status']:
+                table_issues.append(table)
 
     # Check for failed jobs and duration anomalies
     failed_jobs = []
@@ -467,7 +468,10 @@ def render_table_monitor():
                         if not check_result_df.empty:
                             count = int(
                                 check_result_df.iloc[0]["Rows"]) if check_result_df.iloc[0]["Rows"].isdigit() else 0
-                            status = check_result_df.iloc[0]["Status"]
+                            if count == 0:  # Explicitly check for empty tables first
+                                status = "Empty"
+                            else:
+                                status = check_result_df.iloc[0]["Status"]
 
                         size_info = get_table_size_info(
                             row["db_name"], row["table_name"])
@@ -961,7 +965,10 @@ def render_dashboard_view():
             if not result_df.empty:
                 count = int(
                     result_df.iloc[0]["Rows"]) if result_df.iloc[0]["Rows"].isdigit() else 0
-                status = result_df.iloc[0]["Status"]
+                if count == 0:  # Explicitly check for empty tables first
+                    status = "Empty"
+                else:
+                    status = result_df.iloc[0]["Status"]
 
             size_info = get_table_size_info(row["db_name"], row["table_name"])
             data_mb = size_info['data_kb'] / 1024
@@ -1471,7 +1478,10 @@ def get_latest_table_results():
                 if not check_result_df.empty:
                     count = int(
                         check_result_df.iloc[0]["Rows"]) if check_result_df.iloc[0]["Rows"].isdigit() else 0
-                    status = check_result_df.iloc[0]["Status"]
+                    if count == 0:  # Explicitly check for empty tables first
+                        status = "Empty"
+                    else:
+                        status = check_result_df.iloc[0]["Status"]
 
                 # Get size info
                 size_info = get_table_size_info(
