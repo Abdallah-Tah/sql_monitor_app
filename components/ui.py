@@ -528,132 +528,99 @@ def render_table_monitor():
                             else:
                                 st.session_state[f"expanded_table_detail_{idx}"] = True
                     with edit_col:
-                        if st.button("✏️", key=f"edit_table_{idx}", help="Edit table monitoring configuration", use_container_width=True):
+                        if st.button("✏️", key=f"edit_table_{idx}", help="Edit table configuration", use_container_width=True):
                             st.session_state.edit_selected_db = row['db_name']
                             st.session_state.edit_selected_tables = [
                                 row['table_name']]
-                            st.session_state.edit_trigger = True
-                            st.experimental_rerun()  # Rerun to update config panel with these selections
+                            st.session_state.edit_trigger = True  # Signal to set defaults in config section
+                            st.experimental_rerun()  # Rerun to repopulate config with selected table
                     with delete_col:
-                        if st.button("🗑️", key=f"remove_table_{idx}", help="Remove table from monitoring", use_container_width=True):
+                        if st.button("🗑️", key=f"delete_table_{idx}", help="Delete table configuration", use_container_width=True):
                             delete_table_config(
-                                row["db_name"], row["table_name"])
-                            # Also delete associated column configs
-                            save_column_config(
-                                row["db_name"], row["table_name"], [])
+                                row['db_name'], row['table_name'])
+                            st.success(
+                                f"Configuration for {row['db_name']}.{row['table_name']} deleted.")
                             st.experimental_rerun()
 
                     # After the buttons, check if details should be shown for this table
-                    if st.session_state.get(f"expanded_table_detail_{idx}", False):
+                    if st.session_state.get(f"expanded_table_detail_{idx}"):
                         with st.expander(f"Details for {row['db_name']}.{row['table_name']}", expanded=True):
-                            st.markdown(f"**Database:** {row['db_name']}")
-                            st.markdown(f"**Table:** {row['table_name']}")
-                            st.markdown(f"**Current Row Count:** {count}")
-                            st.markdown(f"**Status:** {status}")
-                            min_r_display = row['min_rows'] if pd.notna(
-                                row['min_rows']) else "N/A"
-                            max_r_display = row['max_rows'] if pd.notna(
-                                row['max_rows']) else "N/A"
-                            st.markdown(
-                                f"**Min Rows Threshold:** {min_r_display}")
-                            st.markdown(
-                                f"**Max Rows Threshold:** {max_r_display}")
-                            st.markdown(
-                                f"**Column Min Match Count:** {row['column_min_match_count'] if pd.notna(row['column_min_match_count']) else '1 (Default)'}")
-                            st.markdown(f"**Data Size:** {data_mb:.2f} MB")
-                            st.markdown(f"**Index Size:** {index_mb:.2f} MB")
-                            st.markdown(f"**Total Size:** {total_mb:.2f} MB")
-                            last_check_time = next((item['Last Check'] for item in results if item['Database']
-                                                   == row['db_name'] and item['Table'] == row['table_name']), "N/A")
-                            st.markdown(f"**Last Checked:** {last_check_time}")
-
-                            st.markdown("**Column Conditions:**")
-                            table_column_configs = load_column_config(
-                                row['db_name'], row['table_name'])
-                            if not table_column_configs.empty:
-                                for _, col_cfg in table_column_configs.iterrows():
-                                    val_display = col_cfg['condition_value']
-                                    if col_cfg['condition_type'] == "date_equals_today":
-                                        val_display = "(Current Date)"
-                                    st.markdown(
-                                        f"- `{col_cfg['column_name']}` {col_cfg['condition_type']} `{val_display}`")
+                            # Display column conditions if any
+                            column_configs_df = load_column_config(
+                                row["db_name"], row["table_name"])
+                            if not column_configs_df.empty:
+                                st.markdown("**Monitored Column Conditions:**")
+                                # Convert DataFrame to a more readable list of strings or styled display
+                                for _, cfg_row in column_configs_df.iterrows():
+                                    st.info(
+                                        f"- Column: `{cfg_row['column_name']}`, Condition: `{cfg_row['condition_type']}`, Value: `{cfg_row['condition_value']}`")
                             else:
-                                st.info(
-                                    "No column conditions configured for this table.")
-                            # Add a way to close the expander by clicking the details button again or a close button
-                            if st.button("Close Details", key=f"close_details_table_{idx}"):
-                                st.session_state[f"expanded_table_detail_{idx}"] = False
-                                st.experimental_rerun()
+                                st.markdown(
+                                    "No specific column conditions configured for this table.")
+
+                            # Display raw check_result_df for this table if available
+                            if not check_result_df.empty and 'Column Conditions' in check_result_df.columns:
+                                st.markdown("**Detailed Check Result:**")
+                                # check_result_df.iloc[0]['Column Conditions'] is a dict
+                                detailed_col_conds = check_result_df.iloc[0]['Column Conditions']
+                                if detailed_col_conds and isinstance(detailed_col_conds, dict):
+                                    # Display the dict as JSON
+                                    st.json(detailed_col_conds)
+                                elif not check_result_df.empty:
+                                    # Fallback to dataframe if not a dict
+                                    st.dataframe(check_result_df)
+                                else:
+                                    st.write(
+                                        "No detailed check result available.")
 
                     results.append({
                         'Database': row["db_name"],
                         'Table': row["table_name"],
                         'Row Count': count,
                         'Status': status,
-                        'Min Rows': table_min if table_min is not None else "None",
-                        'Max Rows': table_max if table_max is not None else "None",
+                        'Min Rows': str(table_min) if table_min is not None else "None",
+                        'Max Rows': str(table_max) if table_max is not None else "None",
                         'Data MB': round(data_mb, 2),
                         'Index MB': round(index_mb, 2),
                         'Total MB': round(total_mb, 2),
                         'Last Check': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     })
-
-            if results:
-                st.markdown("### Detailed Status")
-                status_df = pd.DataFrame(results).astype({
-                    'Database': str,
-                    'Table': str,
-                    'Row Count': int,
-                    'Status': str,
-                    'Min Rows': str,
-                    'Max Rows': str,
-                    'Data MB': float,
-                    'Index MB': float,
-                    'Total MB': float,
-                    'Last Check': str
-                })
-                st.dataframe(apply_status_colors(
-                    status_df, 'Status'), use_container_width=True)
         else:
             st.info(
                 "No tables selected for monitoring. Please configure tables above.")
 
-    # New section for viewing rows processed today
-    st.divider()
-    st.subheader("View Processed Rows for Today")
-    selected_db_for_view = st.selectbox(
-        "Select Database for Viewing Processed Rows", get_databases(), key="db_processed_view")
-    if selected_db_for_view:
-        tables_in_db_for_view = get_tables(selected_db_for_view)
-        selected_table_for_view = st.selectbox(
-            "Select Table for Viewing Processed Rows", tables_in_db_for_view, key="table_processed_view")
-        if selected_table_for_view:
-            # Try to guess common date columns or let user input
-            # For now, let's assume a common date column name, e.g., 'MoveDate'
-            # This should ideally be selectable or configurable
-            date_column_name_view = st.text_input(
-                "Enter the date column name (e.g., MoveDate, created_at)", value="MoveDate", key="date_col_processed_view")
-            processed_column_name_view = st.text_input(
-                "Enter the 'processed' status column name", value="Processed", key="proc_col_processed_view")
+    # "Detailed Status" DataFrame display is now outside and after col1 and col2
+    if results:
+        st.markdown("### Detailed Status")
+        # Ensure all expected columns are present before trying to set astype
+        df_columns = ['Database', 'Table', 'Row Count', 'Status', 'Min Rows',
+                      'Max Rows', 'Data MB', 'Index MB', 'Total MB', 'Last Check']
+        # Ensure column order and presence
+        status_df = pd.DataFrame(results, columns=df_columns)
 
-            if st.button("Show Processed Rows for Today", key="show_processed_rows_button"):
-                if not date_column_name_view:
-                    st.warning("Please enter a date column name.")
-                elif not processed_column_name_view:
-                    st.warning("Please enter the processed column name.")
-                else:
-                    with st.spinner(f"Fetching rows from {selected_table_for_view} where {date_column_name_view} is today and {processed_column_name_view} = 1..."):
-                        processed_rows_df = get_rows_for_processed_today(
-                            selected_db_for_view,
-                            selected_table_for_view,
-                            date_column_name_view,
-                            processed_column_name_view
-                        )
-                        if not processed_rows_df.empty:
-                            st.dataframe(processed_rows_df)
-                        else:
-                            st.info(
-                                "No rows found matching the criteria, or an error occurred.")
+        # Convert types, handling potential errors if a column is missing or data is not convertible
+        try:
+            status_df = status_df.astype({
+                'Database': str,
+                'Table': str,
+                'Row Count': int,
+                'Status': str,
+                'Min Rows': str,
+                'Max Rows': str,
+                'Data MB': float,
+                'Index MB': float,
+                'Total MB': float,
+                'Last Check': str
+            })
+        except KeyError as e:
+            st.error(
+                f"Detailed Status DataFrame is missing an expected column: {e}. Please check data population.")
+        except ValueError as e:
+            st.error(
+                f"Detailed Status DataFrame has a column with an unexpected data type: {e}. Please check data population.")
+
+        st.dataframe(apply_status_colors(
+            status_df, 'Status'), use_container_width=True)
 
     return results
 
