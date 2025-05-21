@@ -786,9 +786,10 @@ def check_column_conditions(db, table, column_configs, min_match_count=1):
             if processed_config and date_config:
                 # Build query to check for records matching the conditions
                 query = """
+                DECLARE @Today DATE = CAST(GETDATE() AS DATE);
                 SELECT COUNT(*) 
                 FROM [{0}].[dbo].[MoveFrames] 
-                WHERE CAST(MoveDate AS DATE) = CAST(GETDATE() AS DATE)
+                WHERE CAST(MoveDate AS DATE) = @Today
                 AND Processed = ?
                 """.format(db)
 
@@ -796,11 +797,11 @@ def check_column_conditions(db, table, column_configs, min_match_count=1):
                 matching_count = cursor.fetchone()[0]
 
                 # For MoveFrames, finding records with Processed = 0 means the condition is NOT met
-                # So if we're checking for Processed = 0 and we find records, that's a failure state
-                condition_met = (matching_count == 0 if processed_config["condition_value"] == "0"
-                                 else matching_count > 0)
+                # So if we're checking for Processed = 0 and we find any records, that's a failure state
+                condition_met = False if (
+                    processed_config["condition_value"] == "0" and matching_count > 0) else True
 
-                # Update results for both columns
+                # Update results for both columns to reflect unprocessed records state
                 results[processed_config["column_name"]] = condition_met
                 results[date_config["column_name"]] = condition_met
 
@@ -840,7 +841,10 @@ def check_column_conditions(db, table, column_configs, min_match_count=1):
 
         if where_clauses:
             combined_where = " AND ".join(where_clauses)
-            query = f"SELECT COUNT(*) FROM [{table}] WHERE {combined_where}"
+            query = f"""
+            DECLARE @Today DATE = CAST(GETDATE() AS DATE);
+            SELECT COUNT(*) FROM [{table}] WHERE {combined_where}
+            """
 
             if all_params:
                 cursor.execute(query, all_params)
