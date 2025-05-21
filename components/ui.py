@@ -743,14 +743,27 @@ def render_job_monitor():
                             st.session_state[current_job_session_key_for_expander] = False
                             st.experimental_rerun()
 
-                st.markdown("### Detailed Status")
-                if not monitored_jobs_df.empty:
-                    st.dataframe(apply_status_colors(monitored_jobs_df,
-                                 'Status'), use_container_width=True)
-                else:
-                    st.info("No job data to display for monitored jobs.")
+                # The "Detailed Status" DataFrame for jobs was here, inside col2. It will be moved.
             else:
                 st.info("No jobs currently selected for monitoring.")
+
+    # "Detailed Status" DataFrame for jobs is now outside and after col1 and col2
+    if saved_job_names:  # Check if there are any monitored jobs to display details for
+        st.markdown("### Detailed Status")
+        if isinstance(all_jobs, pd.DataFrame) and 'Job Name' in all_jobs.columns:
+            # Re-filter for monitored_jobs_df to ensure it's available here
+            monitored_jobs_df_for_detail = all_jobs[all_jobs['Job Name'].isin(
+                saved_job_names)]
+            if not monitored_jobs_df_for_detail.empty:
+                st.dataframe(apply_status_colors(monitored_jobs_df_for_detail,
+                                                 'Status'), use_container_width=True)
+            else:
+                # Should not happen if saved_job_names is not empty
+                st.info(
+                    "No job data to display for monitored jobs in Detailed Status.")
+        else:
+            st.info(
+                "Job data is not available in the expected format for Detailed Status.")
 
     with tab2:
         st.subheader("Currently Running Jobs")
