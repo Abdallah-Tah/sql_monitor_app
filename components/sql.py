@@ -858,13 +858,21 @@ def check_column_conditions(db, table, column_configs, min_match_count=1):
             total = cursor.fetchone()[0]
 
             # Determine if conditions are met based on min_match_count
-            if min_match_count == 0:
-                # If 0, all rows in the table must match the conditions
-                # An empty table (total=0) cannot satisfy this
-                condition_met = (count == total and total > 0)
+            condition_met = False  # Default to False
+            is_date_equals_today_present = any(
+                cfg["condition_type"] == "date_equals_today" for cfg in column_configs)
+
+            if table == "UploadLogs" and is_date_equals_today_present and count == 0:
+                condition_met = True  # Special case: 0 matches for today's UploadLogs is OK
             else:
-                # If > 0, at least 'min_match_count' rows must match
-                condition_met = (count >= min_match_count)
+                # Standard logic using the configured min_match_count
+                if min_match_count == 0:
+                    # If 0, all rows in the table must match the conditions
+                    # An empty table (total=0) cannot satisfy this
+                    condition_met = (count == total and total > 0)
+                else:  # min_match_count > 0
+                    # If > 0, at least 'min_match_count' rows must match
+                    condition_met = (count >= min_match_count)
 
             for config_item in column_configs:
                 results[config_item["column_name"]] = condition_met
