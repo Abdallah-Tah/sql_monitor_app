@@ -60,19 +60,24 @@ def show_notifications(table_results, job_results):
     # Check for tables with issues
     table_issues = []
 
-    if table_results:
-        # Find tables with various issues and include them all in table_issues
-        for table in table_results:
-            if table['Status'] == 'Empty':
-                table_issues.append(table)
-            elif table['Status'].startswith('Error'):
-                table_issues.append(table)
-            elif table['Status'] == 'Warn-LowCount':
-                table_issues.append(table)
-            elif table['Status'] == 'Warn-HighCount':
-                table_issues.append(table)
-            elif 'ColumnConditionNotMet' in table['Status']:
-                table_issues.append(table)
+    if table_results:  # table_results is a list of dicts
+        for table_data in table_results:  # Renamed to avoid conflict
+            status = table_data['Status']
+            is_issue = False
+            if status == 'Empty':
+                is_issue = True
+            elif status.startswith('Error'):
+                is_issue = True
+            elif status == 'Warn-LowCount':  # Exact match for simple low count
+                is_issue = True
+            elif status == 'Warn-HighCount':  # Exact match for simple high count
+                is_issue = True
+            # Catch column condition issues that are explicitly warnings or combined with other warnings
+            elif 'ColumnConditionNotMet' in status and ('Warn' in status or ';ColCondNotMet' in status):
+                is_issue = True
+
+            if is_issue:
+                table_issues.append(table_data)
 
     # Check for failed jobs and duration anomalies
     failed_jobs = []
@@ -96,32 +101,54 @@ def show_notifications(table_results, job_results):
             if table_issues:
                 st.subheader("Table Issues")
 
-                # Group notifications by type for better organization
-                if any(t['Status'] == 'Empty' for t in table_issues):
+                # Handle Empty Tables
+                current_display_list = [
+                    t for t in table_issues if t['Status'] == 'Empty']
+                if current_display_list:
                     st.markdown("#### Empty Tables")
-                    for table in [t for t in table_issues if t['Status'] == 'Empty']:
+                    for table_item in current_display_list:
                         st.warning(
-                            f"⚠️ Empty Table: {table['Database']}.{table['Table']}")
+                            f"⚠️ Empty Table: {table_item['Database']}.{table_item['Table']}")
 
-                if any(t['Status'].startswith('Error') for t in table_issues):
+                # Handle Error Tables
+                current_display_list = [
+                    t for t in table_issues if t['Status'].startswith('Error')]
+                if current_display_list:
                     st.markdown("#### Error Tables")
-                    for table in [t for t in table_issues if t['Status'].startswith('Error')]:
+                    for table_item in current_display_list:
                         st.error(
-                            f"❌ Table Error: {table['Database']}.{table['Table']} - {table['Status']}")
+                            f"❌ Table Error: {table_item['Database']}.{table_item['Table']} - {table_item['Status']}")
 
-                if any(t['Status'] == 'Warn-LowCount' for t in table_issues):
+                # Handle Low Row Count (exact status match)
+                current_display_list = [
+                    t for t in table_issues if t['Status'] == 'Warn-LowCount']
+                if current_display_list:
                     st.markdown("#### Low Row Count")
-                    for table in [t for t in table_issues if t['Status'] == 'Warn-LowCount']:
-                        min_rows = table.get('Min Rows', 'N/A')
+                    for table_item in current_display_list:
+                        min_rows = table_item.get('Min Rows', 'N/A')
                         st.warning(
-                            f"⚠️ Low Row Count: {table['Database']}.{table['Table']} - Count: {table['Row Count']}, Min: {min_rows}")
+                            f"⚠️ Low Row Count: {table_item['Database']}.{table_item['Table']} - Count: {table_item.get('Row Count', 'N/A')}, Min: {min_rows}")
 
-                if any(t['Status'] == 'Warn-HighCount' for t in table_issues):
+                # Handle High Row Count (exact status match)
+                current_display_list = [
+                    t for t in table_issues if t['Status'] == 'Warn-HighCount']
+                if current_display_list:
                     st.markdown("#### High Row Count")
-                    for table in [t for t in table_issues if t['Status'] == 'Warn-HighCount']:
-                        max_rows = table.get('Max Rows', 'N/A')
+                    for table_item in current_display_list:
+                        max_rows = table_item.get('Max Rows', 'N/A')
                         st.warning(
-                            f"⚠️ High Row Count: {table['Database']}.{table['Table']} - Count: {table['Row Count']}, Max: {max_rows}")
+                            f"⚠️ High Row Count: {table_item['Database']}.{table_item['Table']} - Count: {table_item.get('Row Count', 'N/A')}, Max: {max_rows}")
+
+                # Handle Column Condition Issues
+                # This will catch statuses like 'Warn-ColumnConditionNotMet'
+                # or combined statuses like 'Warn-LowCount;ColCondNotMet'
+                current_display_list = [t for t in table_issues if 'ColumnConditionNotMet' in t['Status'] and (
+                    'Warn' in t['Status'] or ';ColCondNotMet' in t['Status'])]
+                if current_display_list:
+                    st.markdown("#### Column Condition Issues")
+                    for table_item in current_display_list:
+                        st.warning(
+                            f"⚠️ Condition Issue: {table_item['Database']}.{table_item['Table']} - Status: {table_item['Status']}")
 
             if failed_jobs:
                 st.subheader("Failed Jobs")
